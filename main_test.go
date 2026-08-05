@@ -46,7 +46,7 @@ func TestSearchIsDeterministic(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1, count: 1, workers: 1}
+	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1, count: 1, workers: 1, maxScore: 1, gamma: 2.2}
 	if err := validateConfig(valid); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestValidateConfig(t *testing.T) {
 }
 
 func TestCollectCandidatesReturnsRequestedCount(t *testing.T) {
-	cfg := config{count: 3, burnIn: 50, screenIters: 1000, screenSize: 32, coefficientRange: 3}
+	cfg := config{count: 3, burnIn: 50, screenIters: 1000, screenSize: 32, coefficientRange: 3, maxScore: 1}
 	got, _, attempts, err := collectCandidates(rand.New(rand.NewSource(42)), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -72,5 +72,15 @@ func TestCollectCandidatesReturnsRequestedCount(t *testing.T) {
 		if c.Index != i+1 {
 			t.Fatalf("candidate %d has index %d", i, c.Index)
 		}
+	}
+}
+
+func TestDensitySplat(t *testing.T) {
+	density := make([]uint32, 4)
+	addDensity(density, 2, 2, 0, 0, 10)
+	addDensity(density, 2, 2, 1, 1, 20)
+	addDensity(density, 2, 2, -1, 0, 30)
+	if density[0] != 10 || density[3] != 20 || density[1] != 0 || density[2] != 0 {
+		t.Fatalf("unexpected density: %v", density)
 	}
 }

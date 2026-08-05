@@ -32,9 +32,22 @@ go run . -out output/candidates -count 1000 \
 
 Batch output is named `0001_score-0.812345_id-000123.png` (with a matching
 JSON file), so normal ascending filename order puts the highest-ranked image
-first. Ranking uses metrics recomputed from the full-resolution render, not the
-smaller screening histogram. `batch.json` provides a machine-readable index.
+first. Ranking and score filtering use the fixed-size screening histogram, so
+scores remain comparable when render resolution or quality changes.
+`batch.json` provides a machine-readable index.
 Rendering runs concurrently; use `-workers` to control CPU and memory use.
+
+For higher-quality 16-bit output restricted to a preferred score band:
+
+```sh
+go run . -out output/high-quality -count 1000 -width 1024 -height 1024 \
+  -iterations 20000000 -min-score 0.3 -max-score 0.7 -gamma 2.2
+```
+
+Final images use 32-bit density buffers with subpixel splatting, then a gamma
+lookup table maps density into 16-bit-per-channel PNG. PNG does not support
+32-bit integer channels; the 32-bit values are retained as the accumulation
+precision before tone mapping.
 
 For a quick preview:
 
@@ -56,6 +69,8 @@ Useful flags:
 | `-width`, `-height` | 1600 | final image dimensions |
 | `-count` | 1 | accepted attractors to render; values above 1 enable ranked batch mode |
 | `-workers` | half available CPUs | concurrent batch renderers |
+| `-min-score`, `-max-score` | 0, 1 | accepted batch screening-score interval |
+| `-gamma` | 2.2 | density tone-map gamma; larger values reveal faint details |
 
 ## Selection heuristic
 

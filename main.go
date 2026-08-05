@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const programVersion = "0.2.0"
+const programVersion = "0.3.0"
 
 type coefficients struct {
 	A float64 `json:"a"`
@@ -56,9 +56,10 @@ type candidate struct {
 }
 
 type rejectionCounts struct {
-	Diverged  int `json:"diverged"`
-	ShortLoop int `json:"short_loop"`
-	Sparse    int `json:"sparse"`
+	Diverged         int `json:"diverged"`
+	ShortLoop        int `json:"short_loop"`
+	Sparse           int `json:"sparse"`
+	OutsideScoreBand int `json:"outside_score_band"`
 }
 
 type metadata struct {
@@ -79,6 +80,9 @@ type metadata struct {
 	Rank             int             `json:"rank,omitempty"`
 	CandidateIndex   int             `json:"candidate_index,omitempty"`
 	ScreenMetrics    *metrics        `json:"screen_metrics,omitempty"`
+	Gamma            float64         `json:"gamma"`
+	BitDepth         int             `json:"bit_depth"`
+	DensityBits      int             `json:"density_bits"`
 }
 
 type batchEntry struct {
@@ -103,6 +107,13 @@ type batchMetadata struct {
 	CoefficientRange float64         `json:"coefficient_range"`
 	Rejections       rejectionCounts `json:"rejections"`
 	Entries          []batchEntry    `json:"entries"`
+	MinScore         float64         `json:"min_score"`
+	MaxScore         float64         `json:"max_score"`
+	ScreenIterations int             `json:"screen_iterations"`
+	ScreenSize       int             `json:"screen_size"`
+	Gamma            float64         `json:"gamma"`
+	BitDepth         int             `json:"bit_depth"`
+	DensityBits      int             `json:"density_bits"`
 }
 
 type config struct {
@@ -118,6 +129,9 @@ type config struct {
 	seed             int64
 	count            int
 	workers          int
+	minScore         float64
+	maxScore         float64
+	gamma            float64
 }
 
 func main() {
@@ -142,6 +156,9 @@ func parseFlags() config {
 	flag.Int64Var(&cfg.seed, "seed", 0, "random seed; zero chooses the current time")
 	flag.IntVar(&cfg.count, "count", 1, "number of accepted attractors to render; values above 1 use batch mode")
 	flag.IntVar(&cfg.workers, "workers", max(1, runtime.NumCPU()/2), "parallel render workers in batch mode")
+	flag.Float64Var(&cfg.minScore, "min-score", 0, "minimum stable screening score accepted in batch mode")
+	flag.Float64Var(&cfg.maxScore, "max-score", 1, "maximum stable screening score accepted in batch mode")
+	flag.Float64Var(&cfg.gamma, "gamma", 2.2, "density-to-image gamma; larger values reveal fainter structure")
 	flag.Parse()
 	return cfg
 }
@@ -174,7 +191,11 @@ func run(cfg config) error {
 	if err := ensureParent(pngPath); err != nil {
 		return err
 	}
-	if err := writePNG(pngPath, counts, cfg.width, cfg.height); err != nil {
+	density, _, err := buildDensity32(best.Coefficients, cfg.burnIn, cfg.iterations, cfg.width, cfg.height)
+	if err != nil {
+		return fmt.Errorf("final density: %w", err)
+	}
+	if err := writePNG16Gamma(pngPath, density, cfg.width, cfg.height, cfg.gamma); err != nil {
 		return err
 	}
 	meta := metadata{
@@ -183,6 +204,7 @@ func run(cfg config) error {
 		Width: cfg.width, Height: cfg.height, CoefficientRange: cfg.coefficientRange,
 		Coefficients: best.Coefficients, Bounds: best.Bounds, Metrics: best.Metrics,
 		Rejections: rejects, PNG: filepath.Base(pngPath),
+		Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
 	}
 	if err := writeJSON(jsonPath, meta); err != nil {
 		return err
@@ -215,6 +237,10 @@ func validateConfig(cfg config) error {
 		return errors.New("count must be at least 1")
 	case cfg.workers < 1:
 		return errors.New("workers must be at least 1")
+	case cfg.minScore < 0 || cfg.maxScore > 1 || cfg.minScore > cfg.maxScore:
+		return errors.New("score range must satisfy 0 <= min-score <= max-score <= 1")
+	case cfg.gamma <= 0:
+		return errors.New("gamma must be positive")
 	}
 	return nil
 }
@@ -245,12 +271,11 @@ func runBatch(rng *rand.Rand, cfg config) error {
 			defer wg.Done()
 			for i := range jobs {
 				c := &candidates[i]
-				counts, renderBounds, renderErr := buildHistogram(c.Coefficients, cfg.burnIn, cfg.iterations, cfg.width, cfg.height)
+				density, renderBounds, renderErr := buildDensity32(c.Coefficients, cfg.burnIn, cfg.iterations, cfg.width, cfg.height)
 				if renderErr == nil {
 					c.Bounds = renderBounds
-					c.Metrics = scoreHistogram(counts, cfg.width, cfg.height)
 					c.TempPNG = filepath.Join(stageDir, fmt.Sprintf("candidate-%06d.png", c.Index))
-					renderErr = writePNG(c.TempPNG, counts, cfg.width, cfg.height)
+					renderErr = writePNG16Gamma(c.TempPNG, density, cfg.width, cfg.height, cfg.gamma)
 				}
 				if renderErr != nil {
 					select {
@@ -298,7 +323,7 @@ func runBatch(rng *rand.Rand, cfg config) error {
 			Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width, Height: cfg.height,
 			CoefficientRange: cfg.coefficientRange, Coefficients: c.Coefficients, Bounds: c.Bounds,
 			Metrics: c.Metrics, PNG: filepath.Base(pngPath), Rank: rank, CandidateIndex: c.Index,
-			ScreenMetrics: &c.ScreenMetrics,
+			ScreenMetrics: &c.ScreenMetrics, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
 		}
 		if err := writeJSON(jsonPath, meta); err != nil {
 			return err
@@ -315,6 +340,8 @@ func runBatch(rng *rand.Rand, cfg config) error {
 		Version: programVersion, GeneratedAt: generatedAt, Seed: cfg.seed, Count: cfg.count,
 		Attempts: attempts, Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width,
 		Height: cfg.height, CoefficientRange: cfg.coefficientRange, Rejections: rejects, Entries: entries,
+		MinScore: cfg.minScore, MaxScore: cfg.maxScore, ScreenIterations: cfg.screenIters,
+		ScreenSize: cfg.screenSize, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
 	}
 	if err := writeJSON(filepath.Join(cfg.output, "batch.json"), summary); err != nil {
 		return err
@@ -348,6 +375,10 @@ func collectCandidates(rng *rand.Rand, cfg config) ([]candidate, rejectionCounts
 		m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize)
 		if m.Occupancy < 0.005 || m.OccupiedBins < 64 {
 			rejects.Sparse++
+			continue
+		}
+		if m.Score < cfg.minScore || m.Score > cfg.maxScore {
+			rejects.OutsideScoreBand++
 			continue
 		}
 		candidates = append(candidates, candidate{
@@ -479,6 +510,49 @@ func buildHistogram(p coefficients, burnIn, iterations, width, height int) ([]ui
 	return counts, b, nil
 }
 
+// buildDensity32 accumulates a high-quality density field. Each orbit point is
+// distributed across four neighboring pixels with six bits of subpixel weight.
+// With the validated interestingness band this leaves ample uint32 headroom
+// while reducing the hard, grainy edges caused by nearest-pixel binning.
+func buildDensity32(p coefficients, burnIn, iterations, width, height int) ([]uint32, bounds, error) {
+	b, err := orbitBounds(p, burnIn, iterations)
+	if err != nil {
+		return nil, bounds{}, err
+	}
+	density := make([]uint32, width*height)
+	x, y := 0.1, 0.1
+	for i := 0; i < burnIn+iterations; i++ {
+		x, y = clifford(p, x, y)
+		if i < burnIn {
+			continue
+		}
+		fx := (x - b.MinX) / (b.MaxX - b.MinX) * float64(width-1)
+		fy := (b.MaxY - y) / (b.MaxY - b.MinY) * float64(height-1)
+		x0, y0 := int(math.Floor(fx)), int(math.Floor(fy))
+		if x0 < 0 || x0 >= width || y0 < 0 || y0 >= height {
+			continue
+		}
+		dx, dy := fx-float64(x0), fy-float64(y0)
+		addDensity(density, width, height, x0, y0, uint32(math.Round(64*(1-dx)*(1-dy))))
+		addDensity(density, width, height, x0+1, y0, uint32(math.Round(64*dx*(1-dy))))
+		addDensity(density, width, height, x0, y0+1, uint32(math.Round(64*(1-dx)*dy)))
+		addDensity(density, width, height, x0+1, y0+1, uint32(math.Round(64*dx*dy)))
+	}
+	return density, b, nil
+}
+
+func addDensity(density []uint32, width, height, x, y int, weight uint32) {
+	if weight == 0 || x < 0 || x >= width || y < 0 || y >= height {
+		return
+	}
+	i := y*width + x
+	if ^uint32(0)-density[i] < weight {
+		density[i] = ^uint32(0)
+	} else {
+		density[i] += weight
+	}
+}
+
 func scoreHistogram(counts []uint64, width, height int) metrics {
 	var total, occupied uint64
 	for _, n := range counts {
@@ -566,6 +640,56 @@ func writePNG(path string, counts []uint64, width, height int) error {
 		return fmt.Errorf("close PNG: %w", err)
 	}
 	return nil
+}
+
+func writePNG16Gamma(path string, density []uint32, width, height int, gamma float64) error {
+	var maxDensity uint32
+	for _, n := range density {
+		if n > maxDensity {
+			maxDensity = n
+		}
+	}
+	if maxDensity == 0 {
+		return errors.New("cannot render empty density")
+	}
+	const lutSize = 65536
+	lut := make([]uint16, lutSize)
+	invGamma := 1 / gamma
+	for i := 1; i < lutSize; i++ {
+		linear := float64(i) / float64(lutSize-1)
+		lut[i] = uint16(math.Round(65535 * math.Pow(linear, invGamma)))
+	}
+	img := image.NewRGBA64(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			n := density[y*width+x]
+			index := uint32(uint64(n) * (lutSize - 1) / uint64(maxDensity))
+			v := float64(lut[index]) / 65535
+			img.SetRGBA64(x, y, palette16(v))
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create PNG: %w", err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		f.Close()
+		return fmt.Errorf("encode PNG: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close PNG: %w", err)
+	}
+	return nil
+}
+
+func palette16(v float64) color.RGBA64 {
+	if v <= 0 {
+		return color.RGBA64{R: 771, G: 1285, B: 3084, A: 65535}
+	}
+	r := uint16(65535 * math.Pow(v, 1.6))
+	g := uint16(65535 * math.Pow(v, 0.85))
+	b := uint16(65535 * math.Min(1, 1.8*math.Pow(v, 0.45)))
+	return color.RGBA64{R: r, G: g, B: b, A: 65535}
 }
 
 func palette(v float64) color.RGBA {
