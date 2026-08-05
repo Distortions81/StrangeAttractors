@@ -44,6 +44,24 @@ go run . -out output/high-quality -count 1000 -width 1024 -height 1024 \
   -iterations 20000000 -min-score 0.3 -max-score 0.7 -gamma 2.2
 ```
 
+For the tuned 2048×2048 HDR workflow, use the bundled script:
+
+```sh
+scripts/generate-hdr-batch.sh
+```
+
+It defaults to 1,000 images, 100 million samples per image, score `0.80–1.00`,
+and a timestamped directory under `output/`. Its settings can be overridden by
+environment variables or trailing Go flags:
+
+```sh
+SEED=42 WORKERS=12 scripts/generate-hdr-batch.sh output/my-hdr-batch
+COUNT=20 scripts/generate-hdr-batch.sh output/test -- -exposure 3.0
+```
+
+The script refuses to write into a nonempty directory and removes its temporary
+staging directory if interrupted. Completed output remains untouched.
+
 Final images use 32-bit density buffers with subpixel splatting. A robust
 nonzero-density percentile establishes the white point, an ACES-style filmic
 curve compresses highlights, and a gamma LUT feeds a 16-bit aurora palette from
