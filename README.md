@@ -23,6 +23,19 @@ This writes `output/attractor.png` and `output/attractor.json`. Leave `-seed`
 at zero to choose a time-based seed; the chosen seed is always saved so a run
 can be reproduced.
 
+To generate a ranked batch:
+
+```sh
+go run . -out output/candidates -count 1000 \
+  -width 1024 -height 1024 -seed 20260805
+```
+
+Batch output is named `0001_score-0.812345_id-000123.png` (with a matching
+JSON file), so normal ascending filename order puts the highest-ranked image
+first. Ranking uses metrics recomputed from the full-resolution render, not the
+smaller screening histogram. `batch.json` provides a machine-readable index.
+Rendering runs concurrently; use `-workers` to control CPU and memory use.
+
 For a quick preview:
 
 ```sh
@@ -41,6 +54,8 @@ Useful flags:
 | `-iterations` | 2000000 | points used in the final render |
 | `-burn-in` | 1000 | transient points discarded from each orbit |
 | `-width`, `-height` | 1600 | final image dimensions |
+| `-count` | 1 | accepted attractors to render; values above 1 enable ranked batch mode |
+| `-workers` | half available CPUs | concurrent batch renderers |
 
 ## Selection heuristic
 

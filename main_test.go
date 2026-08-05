@@ -46,12 +46,31 @@ func TestSearchIsDeterministic(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1}
+	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1, count: 1, workers: 1}
 	if err := validateConfig(valid); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 	valid.samples = 0
 	if err := validateConfig(valid); err == nil {
 		t.Fatal("zero samples accepted")
+	}
+}
+
+func TestCollectCandidatesReturnsRequestedCount(t *testing.T) {
+	cfg := config{count: 3, burnIn: 50, screenIters: 1000, screenSize: 32, coefficientRange: 3}
+	got, _, attempts, err := collectCandidates(rand.New(rand.NewSource(42)), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != cfg.count {
+		t.Fatalf("got %d candidates, want %d", len(got), cfg.count)
+	}
+	if attempts < cfg.count {
+		t.Fatalf("attempts = %d, want at least %d", attempts, cfg.count)
+	}
+	for i, c := range got {
+		if c.Index != i+1 {
+			t.Fatalf("candidate %d has index %d", i, c.Index)
+		}
 	}
 }

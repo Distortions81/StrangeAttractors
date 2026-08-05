@@ -12,10 +12,14 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const programVersion = "0.1.0"
+const programVersion = "0.2.0"
 
 type coefficients struct {
 	A float64 `json:"a"`
@@ -43,9 +47,12 @@ type metrics struct {
 }
 
 type candidate struct {
-	Coefficients coefficients
-	Bounds       bounds
-	Metrics      metrics
+	Coefficients  coefficients
+	Bounds        bounds
+	Metrics       metrics
+	ScreenMetrics metrics
+	Index         int
+	TempPNG       string
 }
 
 type rejectionCounts struct {
@@ -69,6 +76,33 @@ type metadata struct {
 	Metrics          metrics         `json:"metrics"`
 	Rejections       rejectionCounts `json:"rejections"`
 	PNG              string          `json:"png"`
+	Rank             int             `json:"rank,omitempty"`
+	CandidateIndex   int             `json:"candidate_index,omitempty"`
+	ScreenMetrics    *metrics        `json:"screen_metrics,omitempty"`
+}
+
+type batchEntry struct {
+	Rank           int          `json:"rank"`
+	CandidateIndex int          `json:"candidate_index"`
+	Score          float64      `json:"score"`
+	Coefficients   coefficients `json:"coefficients"`
+	PNG            string       `json:"png"`
+	Metadata       string       `json:"metadata"`
+}
+
+type batchMetadata struct {
+	Version          string          `json:"version"`
+	GeneratedAt      string          `json:"generated_at"`
+	Seed             int64           `json:"seed"`
+	Count            int             `json:"count"`
+	Attempts         int             `json:"attempts"`
+	Iterations       int             `json:"iterations"`
+	BurnIn           int             `json:"burn_in"`
+	Width            int             `json:"width"`
+	Height           int             `json:"height"`
+	CoefficientRange float64         `json:"coefficient_range"`
+	Rejections       rejectionCounts `json:"rejections"`
+	Entries          []batchEntry    `json:"entries"`
 }
 
 type config struct {
@@ -82,6 +116,8 @@ type config struct {
 	screenSize       int
 	coefficientRange float64
 	seed             int64
+	count            int
+	workers          int
 }
 
 func main() {
@@ -104,6 +140,8 @@ func parseFlags() config {
 	flag.IntVar(&cfg.screenSize, "screen-size", 256, "screening histogram width and height")
 	flag.Float64Var(&cfg.coefficientRange, "range", 3.0, "sample coefficients uniformly from [-range, range]")
 	flag.Int64Var(&cfg.seed, "seed", 0, "random seed; zero chooses the current time")
+	flag.IntVar(&cfg.count, "count", 1, "number of accepted attractors to render; values above 1 use batch mode")
+	flag.IntVar(&cfg.workers, "workers", max(1, runtime.NumCPU()/2), "parallel render workers in batch mode")
 	flag.Parse()
 	return cfg
 }
@@ -116,6 +154,9 @@ func run(cfg config) error {
 		cfg.seed = time.Now().UnixNano()
 	}
 	rng := rand.New(rand.NewSource(cfg.seed))
+	if cfg.count > 1 {
+		return runBatch(rng, cfg)
+	}
 
 	best, rejects, err := search(rng, cfg)
 	if err != nil {
@@ -170,8 +211,158 @@ func validateConfig(cfg config) error {
 		return errors.New("screen-size must be at least 8")
 	case cfg.coefficientRange <= 0:
 		return errors.New("range must be positive")
+	case cfg.count < 1:
+		return errors.New("count must be at least 1")
+	case cfg.workers < 1:
+		return errors.New("workers must be at least 1")
 	}
 	return nil
+}
+
+func runBatch(rng *rand.Rand, cfg config) error {
+	if err := os.MkdirAll(cfg.output, 0o755); err != nil {
+		return fmt.Errorf("create batch directory: %w", err)
+	}
+	stageDir, err := os.MkdirTemp(cfg.output, ".rendering-")
+	if err != nil {
+		return fmt.Errorf("create staging directory: %w", err)
+	}
+
+	candidates, rejects, attempts, err := collectCandidates(rng, cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("accepted %d candidates after %d attempts; rendering with %d workers\n", len(candidates), attempts, min(cfg.workers, cfg.count))
+
+	jobs := make(chan int)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	var completed atomic.Int64
+	workerCount := min(cfg.workers, cfg.count)
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				c := &candidates[i]
+				counts, renderBounds, renderErr := buildHistogram(c.Coefficients, cfg.burnIn, cfg.iterations, cfg.width, cfg.height)
+				if renderErr == nil {
+					c.Bounds = renderBounds
+					c.Metrics = scoreHistogram(counts, cfg.width, cfg.height)
+					c.TempPNG = filepath.Join(stageDir, fmt.Sprintf("candidate-%06d.png", c.Index))
+					renderErr = writePNG(c.TempPNG, counts, cfg.width, cfg.height)
+				}
+				if renderErr != nil {
+					select {
+					case errCh <- fmt.Errorf("candidate %d: %w", c.Index, renderErr):
+					default:
+					}
+					continue
+				}
+				done := completed.Add(1)
+				if done%25 == 0 || int(done) == cfg.count {
+					fmt.Printf("rendered %d/%d\n", done, cfg.count)
+				}
+			}
+		}()
+	}
+	for i := range candidates {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	select {
+	case renderErr := <-errCh:
+		return renderErr
+	default:
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].Metrics.Score > candidates[j].Metrics.Score
+	})
+	entries := make([]batchEntry, 0, len(candidates))
+	generatedAt := time.Now().UTC().Format(time.RFC3339)
+	for i := range candidates {
+		c := &candidates[i]
+		rank := i + 1
+		stem := fmt.Sprintf("%04d_score-%.6f_id-%06d", rank, c.Metrics.Score, c.Index)
+		pngPath, jsonPath := filepath.Join(cfg.output, stem+".png"), filepath.Join(cfg.output, stem+".json")
+		if fileExists(pngPath) || fileExists(jsonPath) {
+			return fmt.Errorf("refusing to overwrite existing result %s", stem)
+		}
+		if err := os.Rename(c.TempPNG, pngPath); err != nil {
+			return fmt.Errorf("publish candidate %d: %w", c.Index, err)
+		}
+		meta := metadata{
+			Version: programVersion, GeneratedAt: generatedAt, Seed: cfg.seed, Samples: 1,
+			Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width, Height: cfg.height,
+			CoefficientRange: cfg.coefficientRange, Coefficients: c.Coefficients, Bounds: c.Bounds,
+			Metrics: c.Metrics, PNG: filepath.Base(pngPath), Rank: rank, CandidateIndex: c.Index,
+			ScreenMetrics: &c.ScreenMetrics,
+		}
+		if err := writeJSON(jsonPath, meta); err != nil {
+			return err
+		}
+		entries = append(entries, batchEntry{
+			Rank: rank, CandidateIndex: c.Index, Score: c.Metrics.Score, Coefficients: c.Coefficients,
+			PNG: filepath.Base(pngPath), Metadata: filepath.Base(jsonPath),
+		})
+	}
+	if err := os.Remove(stageDir); err != nil {
+		return fmt.Errorf("remove empty staging directory: %w", err)
+	}
+	summary := batchMetadata{
+		Version: programVersion, GeneratedAt: generatedAt, Seed: cfg.seed, Count: cfg.count,
+		Attempts: attempts, Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width,
+		Height: cfg.height, CoefficientRange: cfg.coefficientRange, Rejections: rejects, Entries: entries,
+	}
+	if err := writeJSON(filepath.Join(cfg.output, "batch.json"), summary); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %d ranked attractors to %s (best score %.6f)\n", cfg.count, cfg.output, candidates[0].Metrics.Score)
+	return nil
+}
+
+func collectCandidates(rng *rand.Rand, cfg config) ([]candidate, rejectionCounts, int, error) {
+	candidates := make([]candidate, 0, cfg.count)
+	var rejects rejectionCounts
+	maxAttempts := cfg.count * 100
+	for attempts := 1; attempts <= maxAttempts; attempts++ {
+		p := coefficients{
+			A: uniform(rng, cfg.coefficientRange), B: uniform(rng, cfg.coefficientRange),
+			C: uniform(rng, cfg.coefficientRange), D: uniform(rng, cfg.coefficientRange),
+		}
+		if reason := inspectOrbit(p, cfg.burnIn, cfg.screenIters); reason != "" {
+			if reason == "diverged" {
+				rejects.Diverged++
+			} else {
+				rejects.ShortLoop++
+			}
+			continue
+		}
+		counts, b, histogramErr := buildHistogram(p, cfg.burnIn, cfg.screenIters, cfg.screenSize, cfg.screenSize)
+		if histogramErr != nil {
+			rejects.Diverged++
+			continue
+		}
+		m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize)
+		if m.Occupancy < 0.005 || m.OccupiedBins < 64 {
+			rejects.Sparse++
+			continue
+		}
+		candidates = append(candidates, candidate{
+			Coefficients: p, Bounds: b, Metrics: m, ScreenMetrics: m, Index: len(candidates) + 1,
+		})
+		if len(candidates) == cfg.count {
+			return candidates, rejects, attempts, nil
+		}
+	}
+	return nil, rejects, maxAttempts, fmt.Errorf("found only %d usable attractors in %d attempts", len(candidates), maxAttempts)
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func search(rng *rand.Rand, cfg config) (candidate, rejectionCounts, error) {
