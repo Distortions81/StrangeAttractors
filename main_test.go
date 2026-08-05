@@ -18,15 +18,55 @@ func TestCliffordStep(t *testing.T) {
 
 func TestScoreHistogram(t *testing.T) {
 	uniform := []uint64{1, 1, 1, 1}
-	m := scoreHistogram(uniform, 2, 2)
-	if m.Occupancy != 1 || math.Abs(m.Entropy-1) > 1e-12 || math.Abs(m.Symmetry-1) > 1e-12 {
+	m := scoreHistogram(uniform, 2, 2, 0.1)
+	if m.Occupancy != 1 || math.Abs(m.Entropy-1) > 1e-12 || math.Abs(m.GlobalEntropy-1) > 1e-12 || math.Abs(m.Symmetry-1) > 1e-12 {
 		t.Fatalf("unexpected uniform metrics: %+v", m)
 	}
 
 	concentrated := []uint64{100, 0, 0, 0}
-	c := scoreHistogram(concentrated, 2, 2)
+	c := scoreHistogram(concentrated, 2, 2, 0)
 	if c.Occupancy != 0.25 || c.Entropy != 0 || c.Symmetry != 0 {
 		t.Fatalf("unexpected concentrated metrics: %+v", c)
+	}
+}
+
+func TestVisualScorePenalizesEmptyAndFullHistograms(t *testing.T) {
+	const size = 64
+	full := make([]uint64, size*size)
+	for i := range full {
+		full[i] = 1
+	}
+	sparse := make([]uint64, size*size)
+	for i := 0; i < 8; i++ {
+		sparse[i*size+i] = 1
+	}
+	structured := make([]uint64, size*size)
+	for y := 8; y < 56; y++ {
+		x := 16 + (y*y/19)%32
+		structured[y*size+x] = 1
+		structured[y*size+x+1] = 1
+	}
+	fullScore := scoreHistogram(full, size, size, 0.1).Score
+	sparseScore := scoreHistogram(sparse, size, size, 0.1).Score
+	structuredScore := scoreHistogram(structured, size, size, 0.1).Score
+	if structuredScore <= sparseScore || structuredScore <= fullScore {
+		t.Fatalf("structured score %.3f should exceed sparse %.3f and full %.3f", structuredScore, sparseScore, fullScore)
+	}
+}
+
+func TestLyapunovKnownCliffordMap(t *testing.T) {
+	chaotic := coefficients{A: -1.4, B: 1.6, C: 1.0, D: 0.7}
+	exponent := estimateLyapunov(chaotic, 1000, 20_000)
+	if math.IsNaN(exponent) || math.IsInf(exponent, 0) {
+		t.Fatalf("invalid exponent: %g", exponent)
+	}
+}
+
+func TestHistogramQuantilesIgnoreOutliers(t *testing.T) {
+	counts := []uint64{1, 0, 1000, 1000, 0, 1}
+	low, high := histogramQuantiles(counts, 0, 6, 0.01, 0.99)
+	if low != 2 || high != 4 {
+		t.Fatalf("quantiles = (%g, %g), want (2, 4)", low, high)
 	}
 }
 
@@ -46,7 +86,7 @@ func TestSearchIsDeterministic(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1, count: 1, workers: 1, maxScore: 1, gamma: 2.2}
+	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1, count: 1, workers: 1, maxScore: 1, gamma: 2.2, exposure: 2.5, whitePercentile: 99.5}
 	if err := validateConfig(valid); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
@@ -82,5 +122,24 @@ func TestDensitySplat(t *testing.T) {
 	addDensity(density, 2, 2, -1, 0, 30)
 	if density[0] != 10 || density[3] != 20 || density[1] != 0 || density[2] != 0 {
 		t.Fatalf("unexpected density: %v", density)
+	}
+}
+
+func TestDensityPercentileIgnoresHotPixel(t *testing.T) {
+	density := []uint32{0, 10, 10, 10, 10, 10000}
+	white := densityPercentile(density, 10000, 0.8)
+	if white < 9 || white > 11 {
+		t.Fatalf("white point = %d, want approximately 10", white)
+	}
+}
+
+func TestACESToneMapIsMonotonic(t *testing.T) {
+	previous := 0.0
+	for _, input := range []float64{0, 0.01, 0.1, 0.5, 1, 2, 10} {
+		got := acesToneMap(input)
+		if got < previous || got < 0 || got > 1 {
+			t.Fatalf("tone map(%g) = %g after %g", input, got, previous)
+		}
+		previous = got
 	}
 }

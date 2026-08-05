@@ -40,9 +40,16 @@ type metrics struct {
 	HistogramBins      int     `json:"histogram_bins"`
 	Occupancy          float64 `json:"occupancy"`
 	Entropy            float64 `json:"entropy"`
+	GlobalEntropy      float64 `json:"global_entropy"`
+	BoxDimension       float64 `json:"box_dimension"`
 	VerticalSymmetry   float64 `json:"vertical_symmetry"`
 	HorizontalSymmetry float64 `json:"horizontal_symmetry"`
 	Symmetry           float64 `json:"symmetry"`
+	CoverageScore      float64 `json:"coverage_score"`
+	EntropyScore       float64 `json:"entropy_score"`
+	DimensionScore     float64 `json:"dimension_score"`
+	LyapunovExponent   float64 `json:"lyapunov_exponent"`
+	ChaosScore         float64 `json:"chaos_score"`
 	Score              float64 `json:"score"`
 }
 
@@ -83,6 +90,10 @@ type metadata struct {
 	Gamma            float64         `json:"gamma"`
 	BitDepth         int             `json:"bit_depth"`
 	DensityBits      int             `json:"density_bits"`
+	ToneMap          string          `json:"tone_map"`
+	Palette          string          `json:"palette"`
+	Exposure         float64         `json:"exposure"`
+	WhitePercentile  float64         `json:"white_percentile"`
 }
 
 type batchEntry struct {
@@ -114,6 +125,10 @@ type batchMetadata struct {
 	Gamma            float64         `json:"gamma"`
 	BitDepth         int             `json:"bit_depth"`
 	DensityBits      int             `json:"density_bits"`
+	ToneMap          string          `json:"tone_map"`
+	Palette          string          `json:"palette"`
+	Exposure         float64         `json:"exposure"`
+	WhitePercentile  float64         `json:"white_percentile"`
 }
 
 type config struct {
@@ -132,6 +147,8 @@ type config struct {
 	minScore         float64
 	maxScore         float64
 	gamma            float64
+	exposure         float64
+	whitePercentile  float64
 }
 
 func main() {
@@ -159,6 +176,8 @@ func parseFlags() config {
 	flag.Float64Var(&cfg.minScore, "min-score", 0, "minimum stable screening score accepted in batch mode")
 	flag.Float64Var(&cfg.maxScore, "max-score", 1, "maximum stable screening score accepted in batch mode")
 	flag.Float64Var(&cfg.gamma, "gamma", 2.2, "density-to-image gamma; larger values reveal fainter structure")
+	flag.Float64Var(&cfg.exposure, "exposure", 2.5, "HDR exposure before filmic tone mapping")
+	flag.Float64Var(&cfg.whitePercentile, "white-percentile", 99.5, "nonzero density percentile mapped near white")
 	flag.Parse()
 	return cfg
 }
@@ -184,7 +203,7 @@ func run(cfg config) error {
 		return fmt.Errorf("final render: %w", err)
 	}
 	best.Bounds = renderBounds
-	best.Metrics = scoreHistogram(counts, cfg.width, cfg.height)
+	best.Metrics = scoreHistogram(counts, cfg.width, cfg.height, best.Metrics.LyapunovExponent)
 
 	pngPath := cfg.output + ".png"
 	jsonPath := cfg.output + ".json"
@@ -195,7 +214,7 @@ func run(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("final density: %w", err)
 	}
-	if err := writePNG16Gamma(pngPath, density, cfg.width, cfg.height, cfg.gamma); err != nil {
+	if err := writePNG16HDR(pngPath, density, cfg.width, cfg.height, cfg.gamma, cfg.exposure, cfg.whitePercentile); err != nil {
 		return err
 	}
 	meta := metadata{
@@ -204,7 +223,8 @@ func run(cfg config) error {
 		Width: cfg.width, Height: cfg.height, CoefficientRange: cfg.coefficientRange,
 		Coefficients: best.Coefficients, Bounds: best.Bounds, Metrics: best.Metrics,
 		Rejections: rejects, PNG: filepath.Base(pngPath),
-		Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
+		Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32, ToneMap: "aces-fitted",
+		Palette: "aurora", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
 	}
 	if err := writeJSON(jsonPath, meta); err != nil {
 		return err
@@ -241,6 +261,10 @@ func validateConfig(cfg config) error {
 		return errors.New("score range must satisfy 0 <= min-score <= max-score <= 1")
 	case cfg.gamma <= 0:
 		return errors.New("gamma must be positive")
+	case cfg.exposure <= 0:
+		return errors.New("exposure must be positive")
+	case cfg.whitePercentile <= 0 || cfg.whitePercentile > 100:
+		return errors.New("white-percentile must be in (0, 100]")
 	}
 	return nil
 }
@@ -275,7 +299,7 @@ func runBatch(rng *rand.Rand, cfg config) error {
 				if renderErr == nil {
 					c.Bounds = renderBounds
 					c.TempPNG = filepath.Join(stageDir, fmt.Sprintf("candidate-%06d.png", c.Index))
-					renderErr = writePNG16Gamma(c.TempPNG, density, cfg.width, cfg.height, cfg.gamma)
+					renderErr = writePNG16HDR(c.TempPNG, density, cfg.width, cfg.height, cfg.gamma, cfg.exposure, cfg.whitePercentile)
 				}
 				if renderErr != nil {
 					select {
@@ -324,6 +348,7 @@ func runBatch(rng *rand.Rand, cfg config) error {
 			CoefficientRange: cfg.coefficientRange, Coefficients: c.Coefficients, Bounds: c.Bounds,
 			Metrics: c.Metrics, PNG: filepath.Base(pngPath), Rank: rank, CandidateIndex: c.Index,
 			ScreenMetrics: &c.ScreenMetrics, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
+			ToneMap: "aces-fitted", Palette: "aurora", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
 		}
 		if err := writeJSON(jsonPath, meta); err != nil {
 			return err
@@ -342,6 +367,7 @@ func runBatch(rng *rand.Rand, cfg config) error {
 		Height: cfg.height, CoefficientRange: cfg.coefficientRange, Rejections: rejects, Entries: entries,
 		MinScore: cfg.minScore, MaxScore: cfg.maxScore, ScreenIterations: cfg.screenIters,
 		ScreenSize: cfg.screenSize, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
+		ToneMap: "aces-fitted", Palette: "aurora", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
 	}
 	if err := writeJSON(filepath.Join(cfg.output, "batch.json"), summary); err != nil {
 		return err
@@ -372,7 +398,8 @@ func collectCandidates(rng *rand.Rand, cfg config) ([]candidate, rejectionCounts
 			rejects.Diverged++
 			continue
 		}
-		m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize)
+		lyapunov := estimateLyapunov(p, cfg.burnIn, min(cfg.screenIters, 50_000))
+		m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize, lyapunov)
 		if m.Occupancy < 0.005 || m.OccupiedBins < 64 {
 			rejects.Sparse++
 			continue
@@ -418,7 +445,8 @@ func search(rng *rand.Rand, cfg config) (candidate, rejectionCounts, error) {
 			rejects.Diverged++
 			continue
 		}
-		m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize)
+		lyapunov := estimateLyapunov(p, cfg.burnIn, min(cfg.screenIters, 50_000))
+		m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize, lyapunov)
 		// Very sparse plots are usually fixed points, thin cycles, or uninteresting dust.
 		if m.Occupancy < 0.005 || m.OccupiedBins < 64 {
 			rejects.Sparse++
@@ -463,30 +491,72 @@ func inspectOrbit(p coefficients, burnIn, iterations int) string {
 }
 
 func orbitBounds(p coefficients, burnIn, iterations int) (bounds, error) {
+	const quantileBins = 4096
 	x, y := 0.1, 0.1
-	b := bounds{MinX: math.Inf(1), MaxX: math.Inf(-1), MinY: math.Inf(1), MaxY: math.Inf(-1)}
+	limitX, limitY := 1+math.Abs(p.C), 1+math.Abs(p.D)
+	var xCounts, yCounts [quantileBins]uint64
 	for i := 0; i < burnIn+iterations; i++ {
 		x, y = clifford(p, x, y)
 		if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
 			return bounds{}, errors.New("orbit diverged")
 		}
 		if i >= burnIn {
-			b.MinX = math.Min(b.MinX, x)
-			b.MaxX = math.Max(b.MaxX, x)
-			b.MinY = math.Min(b.MinY, y)
-			b.MaxY = math.Max(b.MaxY, y)
+			xCounts[boundedBin(x, -limitX, limitX, quantileBins)]++
+			yCounts[boundedBin(y, -limitY, limitY, quantileBins)]++
 		}
 	}
+	minX, maxX := histogramQuantiles(xCounts[:], -limitX, limitX, 0.001, 0.999)
+	minY, maxY := histogramQuantiles(yCounts[:], -limitY, limitY, 0.001, 0.999)
+	b := bounds{MinX: minX, MaxX: maxX, MinY: minY, MaxY: maxY}
 	if b.MaxX-b.MinX < 1e-12 || b.MaxY-b.MinY < 1e-12 {
 		return bounds{}, errors.New("orbit collapsed to a point or line")
 	}
-	// A small border keeps the plotted orbit off the image edges.
+	// Quantile framing ignores rare outliers that would otherwise shrink the
+	// visually dominant structure. A small border keeps it off the image edges.
 	padX, padY := (b.MaxX-b.MinX)*0.015, (b.MaxY-b.MinY)*0.015
 	b.MinX -= padX
 	b.MaxX += padX
 	b.MinY -= padY
 	b.MaxY += padY
 	return b, nil
+}
+
+func boundedBin(value, low, high float64, bins int) int {
+	i := int((value - low) / (high - low) * float64(bins))
+	if i < 0 {
+		return 0
+	}
+	if i >= bins {
+		return bins - 1
+	}
+	return i
+}
+
+func histogramQuantiles(counts []uint64, low, high, lowerQ, upperQ float64) (float64, float64) {
+	var total uint64
+	for _, n := range counts {
+		total += n
+	}
+	if total == 0 {
+		return low, high
+	}
+	lowerTarget := uint64(math.Ceil(float64(total) * lowerQ))
+	upperTarget := uint64(math.Ceil(float64(total) * upperQ))
+	lowerIndex, upperIndex := 0, len(counts)-1
+	var cumulative uint64
+	foundLower := false
+	for i, n := range counts {
+		cumulative += n
+		if !foundLower && cumulative >= lowerTarget {
+			lowerIndex, foundLower = i, true
+		}
+		if cumulative >= upperTarget {
+			upperIndex = i
+			break
+		}
+	}
+	step := (high - low) / float64(len(counts))
+	return low + float64(lowerIndex)*step, low + float64(upperIndex+1)*step
 }
 
 func buildHistogram(p coefficients, burnIn, iterations, width, height int) ([]uint64, bounds, error) {
@@ -553,7 +623,7 @@ func addDensity(density []uint32, width, height, x, y int, weight uint32) {
 	}
 }
 
-func scoreHistogram(counts []uint64, width, height int) metrics {
+func scoreHistogram(counts []uint64, width, height int, lyapunov float64) metrics {
 	var total, occupied uint64
 	for _, n := range counts {
 		total += n
@@ -577,12 +647,116 @@ func scoreHistogram(counts []uint64, width, height int) metrics {
 	if occupied > 1 {
 		m.Entropy = entropy / math.Log(float64(occupied))
 	}
+	if len(counts) > 1 {
+		m.GlobalEntropy = entropy / math.Log(float64(len(counts)))
+	}
+	m.BoxDimension = boxCountingDimension(counts, width, height)
 	m.VerticalSymmetry = reflectionSimilarity(counts, width, height, true)
 	m.HorizontalSymmetry = reflectionSimilarity(counts, width, height, false)
 	m.Symmetry = math.Max(m.VerticalSymmetry, m.HorizontalSymmetry)
-	// Occupancy is square-rooted so delicate structures can compete with solid blobs.
-	m.Score = 0.35*math.Sqrt(m.Occupancy) + 0.50*m.Entropy + 0.15*m.Symmetry
+
+	// Visual interest is non-monotonic: both near-empty loops and screen-filling
+	// noise are less useful than moderately occupied, filamentary structures.
+	m.CoverageScore = bandPreference(m.Occupancy, 0.01, 0.04, 0.22, 0.48)
+	m.EntropyScore = bandPreference(m.GlobalEntropy, 0.20, 0.45, 0.82, 0.96)
+	m.DimensionScore = math.Exp(-0.5 * math.Pow((m.BoxDimension-1.72)/0.10, 2))
+	m.LyapunovExponent = lyapunov
+	m.ChaosScore = smoothStep((lyapunov - 0.05) / (1.0 - 0.05))
+	baseScore := 0.30*m.CoverageScore + 0.40*m.DimensionScore + 0.25*m.EntropyScore + 0.05*m.ChaosScore
+	// Coverage is also a viability gate: an almost empty loop or a nearly solid
+	// cloud cannot offset poor framing merely by scoring well on another axis.
+	m.Score = baseScore * (0.10 + 0.90*math.Sqrt(m.CoverageScore))
 	return m
+}
+
+// estimateLyapunov follows a tangent vector through the analytic Jacobian of
+// the Clifford map. Positive values indicate sensitive dependence on initial
+// conditions; larger positive values receive the maximum chaos preference.
+func estimateLyapunov(p coefficients, burnIn, iterations int) float64 {
+	x, y := 0.1, 0.1
+	vx, vy := 1.0, 0.0
+	var sum float64
+	for i := 0; i < burnIn+iterations; i++ {
+		j00 := -p.A * p.C * math.Sin(p.A*x)
+		j01 := p.A * math.Cos(p.A*y)
+		j10 := p.B * math.Cos(p.B*x)
+		j11 := -p.B * p.D * math.Sin(p.B*y)
+		nx, ny := j00*vx+j01*vy, j10*vx+j11*vy
+		norm := math.Hypot(nx, ny)
+		if norm < 1e-300 || math.IsNaN(norm) || math.IsInf(norm, 0) {
+			return math.Inf(-1)
+		}
+		vx, vy = nx/norm, ny/norm
+		x, y = clifford(p, x, y)
+		if i >= burnIn {
+			sum += math.Log(norm)
+		}
+	}
+	return sum / float64(iterations)
+}
+
+func bandPreference(value, low, idealLow, idealHigh, high float64) float64 {
+	switch {
+	case value <= low || value >= high:
+		return 0
+	case value < idealLow:
+		return smoothStep((value - low) / (idealLow - low))
+	case value <= idealHigh:
+		return 1
+	default:
+		return smoothStep((high - value) / (high - idealHigh))
+	}
+}
+
+func smoothStep(x float64) float64 {
+	x = math.Max(0, math.Min(1, x))
+	return x * x * (3 - 2*x)
+}
+
+func boxCountingDimension(counts []uint64, width, height int) float64 {
+	maxScale := min(width, height) / 4
+	var xs, ys []float64
+	for boxSize := 2; boxSize <= 32 && boxSize <= maxScale; boxSize *= 2 {
+		boxesX := (width + boxSize - 1) / boxSize
+		boxesY := (height + boxSize - 1) / boxSize
+		occupied := make([]bool, boxesX*boxesY)
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				if counts[y*width+x] > 0 {
+					occupied[(y/boxSize)*boxesX+x/boxSize] = true
+				}
+			}
+		}
+		var n int
+		for _, hit := range occupied {
+			if hit {
+				n++
+			}
+		}
+		if n > 1 {
+			xs = append(xs, math.Log(float64(min(width, height))/float64(boxSize)))
+			ys = append(ys, math.Log(float64(n)))
+		}
+	}
+	if len(xs) < 2 {
+		return 0
+	}
+	var meanX, meanY float64
+	for i := range xs {
+		meanX += xs[i]
+		meanY += ys[i]
+	}
+	meanX /= float64(len(xs))
+	meanY /= float64(len(ys))
+	var covariance, variance float64
+	for i := range xs {
+		covariance += (xs[i] - meanX) * (ys[i] - meanY)
+		variance += (xs[i] - meanX) * (xs[i] - meanX)
+	}
+	if variance == 0 {
+		return 0
+	}
+	return covariance / variance
 }
 
 func reflectionSimilarity(counts []uint64, width, height int, vertical bool) float64 {
@@ -642,7 +816,7 @@ func writePNG(path string, counts []uint64, width, height int) error {
 	return nil
 }
 
-func writePNG16Gamma(path string, density []uint32, width, height int, gamma float64) error {
+func writePNG16HDR(path string, density []uint32, width, height int, gamma, exposure, whitePercentile float64) error {
 	var maxDensity uint32
 	for _, n := range density {
 		if n > maxDensity {
@@ -652,20 +826,22 @@ func writePNG16Gamma(path string, density []uint32, width, height int, gamma flo
 	if maxDensity == 0 {
 		return errors.New("cannot render empty density")
 	}
+	whitePoint := densityPercentile(density, maxDensity, whitePercentile/100)
 	const lutSize = 65536
 	lut := make([]uint16, lutSize)
 	invGamma := 1 / gamma
 	for i := 1; i < lutSize; i++ {
-		linear := float64(i) / float64(lutSize-1)
-		lut[i] = uint16(math.Round(65535 * math.Pow(linear, invGamma)))
+		linear := float64(i) / float64(lutSize-1) * exposure
+		mapped := acesToneMap(linear)
+		lut[i] = uint16(math.Round(65535 * math.Pow(mapped, invGamma)))
 	}
 	img := image.NewRGBA64(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			n := density[y*width+x]
-			index := uint32(uint64(n) * (lutSize - 1) / uint64(maxDensity))
+			index := uint32(min(uint64(lutSize-1), uint64(n)*(lutSize-1)/uint64(whitePoint)))
 			v := float64(lut[index]) / 65535
-			img.SetRGBA64(x, y, palette16(v))
+			img.SetRGBA64(x, y, auroraPalette(v))
 		}
 	}
 	f, err := os.Create(path)
@@ -682,14 +858,63 @@ func writePNG16Gamma(path string, density []uint32, width, height int, gamma flo
 	return nil
 }
 
-func palette16(v float64) color.RGBA64 {
-	if v <= 0 {
-		return color.RGBA64{R: 771, G: 1285, B: 3084, A: 65535}
+func densityPercentile(density []uint32, maxDensity uint32, percentile float64) uint32 {
+	const bins = 65536
+	histogram := make([]uint64, bins)
+	var nonzero uint64
+	for _, n := range density {
+		if n == 0 {
+			continue
+		}
+		index := uint32(uint64(n) * (bins - 1) / uint64(maxDensity))
+		histogram[index]++
+		nonzero++
 	}
-	r := uint16(65535 * math.Pow(v, 1.6))
-	g := uint16(65535 * math.Pow(v, 0.85))
-	b := uint16(65535 * math.Min(1, 1.8*math.Pow(v, 0.45)))
-	return color.RGBA64{R: r, G: g, B: b, A: 65535}
+	target := uint64(math.Ceil(float64(nonzero) * percentile))
+	var cumulative uint64
+	for i, n := range histogram {
+		cumulative += n
+		if cumulative >= target {
+			return max(1, uint32(uint64(i)*uint64(maxDensity)/(bins-1)))
+		}
+	}
+	return maxDensity
+}
+
+func acesToneMap(x float64) float64 {
+	value := x * (2.51*x + 0.03) / (x*(2.43*x+0.59) + 0.14)
+	return math.Max(0, math.Min(1, value))
+}
+
+type colorStop struct{ Position, R, G, B float64 }
+
+func auroraPalette(v float64) color.RGBA64 {
+	stops := [...]colorStop{
+		{0.00, 0.012, 0.020, 0.047},
+		{0.08, 0.025, 0.035, 0.160},
+		{0.24, 0.180, 0.075, 0.520},
+		{0.42, 0.035, 0.360, 1.000},
+		{0.62, 0.020, 0.920, 0.940},
+		{0.78, 0.480, 1.000, 0.760},
+		{0.91, 1.000, 0.620, 0.160},
+		{1.00, 1.000, 0.985, 0.900},
+	}
+	if v <= 0 {
+		return rgba64(stops[0].R, stops[0].G, stops[0].B)
+	}
+	for i := 1; i < len(stops); i++ {
+		if v <= stops[i].Position {
+			a, b := stops[i-1], stops[i]
+			t := smoothStep((v - a.Position) / (b.Position - a.Position))
+			return rgba64(a.R+(b.R-a.R)*t, a.G+(b.G-a.G)*t, a.B+(b.B-a.B)*t)
+		}
+	}
+	last := stops[len(stops)-1]
+	return rgba64(last.R, last.G, last.B)
+}
+
+func rgba64(r, g, b float64) color.RGBA64 {
+	return color.RGBA64{R: uint16(math.Round(65535 * r)), G: uint16(math.Round(65535 * g)), B: uint16(math.Round(65535 * b)), A: 65535}
 }
 
 func palette(v float64) color.RGBA {
