@@ -84,13 +84,15 @@ FRAMES=24 WIDTH=512 HEIGHT=512 ITERATIONS=2000000 \
   scripts/generate-evolution.sh output/evolution-preview
 ```
 
-Frames are named `frame-000000_score-0.712345.png`; matching JSON files capture
-the parent, mutation distance, raw and smoothed framing, coefficients, score,
-and render settings. `evolution.json` indexes the complete lineage. To make a
-10-bit HEVC movie at 30 fps from inside its output directory:
+Frames use Resolve-friendly names such as `frame_000000.png`; scores stay in
+matching JSON sidecars instead of the image filename. The sidecars capture the
+parent, mutation distance, raw and smoothed framing, coefficients, score, and
+render settings. `evolution.json` stores the artwork title and indexes the
+complete lineage. Set `TITLE="Electric Wings"` to give a render a display name.
+To make a 10-bit HEVC movie at 30 fps from inside its output directory:
 
 ```sh
-ffmpeg -framerate 30 -pattern_type glob -i 'frame-*.png' \
+ffmpeg -framerate 30 -i 'frame_%06d.png' \
   -c:v libx265 -pix_fmt yuv420p10le evolution.mp4
 ```
 
@@ -134,6 +136,7 @@ Useful flags:
 | `-glow-threshold` | 0.65 | glow onset relative to the density white point |
 | `-softness` | 2 | linear-density reconstruction smoothing passes |
 | `-evolve-frames` | 0 | numbered lineage frames; zero disables evolution mode |
+| `-evolve-name` | empty | artwork title stored in `evolution.json` |
 | `-evolve-offspring` | 48 | viable mutations considered for each next frame |
 | `-evolve-mutation` | 0.035 | coefficient mutation scale per frame |
 | `-evolve-min-score` | 0.65 | minimum visual score retained throughout the lineage |

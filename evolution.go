@@ -40,6 +40,7 @@ type evolutionEntry struct {
 
 type evolutionMetadata struct {
 	Version          string           `json:"version"`
+	Name             string           `json:"name,omitempty"`
 	GeneratedAt      string           `json:"generated_at"`
 	Seed             int64            `json:"seed"`
 	Frames           int              `json:"frames"`
@@ -97,7 +98,7 @@ func runEvolution(rng *rand.Rand, cfg config) error {
 	smoothed := smoothEvolutionBounds(rawBounds, min(6, max(1, len(frames)/12)))
 	for i := range frames {
 		frames[i].Candidate.Bounds = smoothed[i]
-		stem := fmt.Sprintf("frame-%06d_score-%.6f", i, frames[i].Candidate.Metrics.Score)
+		stem := fmt.Sprintf("frame_%06d", i)
 		frames[i].PNGPath = filepath.Join(cfg.output, stem+".png")
 		frames[i].JSONPath = filepath.Join(cfg.output, stem+".json")
 		if fileExists(frames[i].PNGPath) || fileExists(frames[i].JSONPath) {
@@ -179,7 +180,7 @@ func runEvolution(rng *rand.Rand, cfg config) error {
 		}
 	}
 	manifest := evolutionMetadata{
-		Version: programVersion, GeneratedAt: generatedAt, Seed: cfg.seed, Frames: len(frames),
+		Version: programVersion, Name: cfg.evolveName, GeneratedAt: generatedAt, Seed: cfg.seed, Frames: len(frames),
 		Width: cfg.width, Height: cfg.height, Iterations: cfg.iterations, Offspring: cfg.evolveOffspring,
 		Mutation: cfg.evolveMutation, MinimumScore: cfg.evolveMinScore, CoefficientRange: cfg.coefficientRange,
 		Entries: entries,

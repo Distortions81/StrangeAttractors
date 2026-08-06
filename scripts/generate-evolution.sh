@@ -25,6 +25,7 @@ Environment overrides:
   EVOLVE_OFFSPRING=48
   EVOLVE_MUTATION=0.035
   EVOLVE_MIN_SCORE=0.65
+  TITLE=<output directory name>  # artwork title stored in evolution.json
   GAMMA=1.8
   EXPOSURE=0.9
   WHITE_PERCENTILE=99.7
@@ -70,6 +71,7 @@ samples=${SAMPLES:-256}
 offspring=${EVOLVE_OFFSPRING:-48}
 mutation=${EVOLVE_MUTATION:-0.035}
 min_score=${EVOLVE_MIN_SCORE:-0.65}
+title=${TITLE:-$(basename -- "$output_dir")}
 gamma=${GAMMA:-1.8}
 exposure=${EXPOSURE:-0.9}
 white_percentile=${WHITE_PERCENTILE:-99.7}
@@ -95,6 +97,7 @@ cd -- "$repo_dir"
 go run . \
     -out "$output_dir" \
     -evolve-frames "$frames" \
+    -evolve-name "$title" \
     -evolve-offspring "$offspring" \
     -evolve-mutation "$mutation" \
     -evolve-min-score "$min_score" \

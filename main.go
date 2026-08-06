@@ -167,6 +167,7 @@ type config struct {
 	glowThreshold    float64
 	softness         int
 	evolveFrames     int
+	evolveName       string
 	evolveOffspring  int
 	evolveMutation   float64
 	evolveMinScore   float64
@@ -205,6 +206,7 @@ func parseFlags() config {
 	flag.Float64Var(&cfg.glowThreshold, "glow-threshold", 0.65, "glow starts at this multiple of the density white point")
 	flag.IntVar(&cfg.softness, "softness", 2, "small linear-density smoothing passes before tone mapping")
 	flag.IntVar(&cfg.evolveFrames, "evolve-frames", 0, "generate a coherent evolutionary PNG sequence")
+	flag.StringVar(&cfg.evolveName, "evolve-name", "", "artwork title recorded in the evolution manifest")
 	flag.IntVar(&cfg.evolveOffspring, "evolve-offspring", 48, "mutated descendants evaluated for each evolution frame")
 	flag.Float64Var(&cfg.evolveMutation, "evolve-mutation", 0.035, "coefficient mutation standard deviation per frame")
 	flag.Float64Var(&cfg.evolveMinScore, "evolve-min-score", 0.65, "minimum visual score for every selected descendant")
