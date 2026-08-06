@@ -18,14 +18,19 @@ Environment overrides:
   COUNT=1000
   WIDTH=2048
   HEIGHT=2048
-  ITERATIONS=100000000
+  ITERATIONS=200000000
   SCREEN_ITERATIONS=200000
   SCREEN_SIZE=256
   MIN_SCORE=0.80
   MAX_SCORE=1.0
-  GAMMA=2.2
-  EXPOSURE=2.5
-  WHITE_PERCENTILE=99.5
+  GAMMA=1.8
+  EXPOSURE=0.9
+  WHITE_PERCENTILE=99.7
+  SUPERSAMPLE=3
+  GLOW_STRENGTH=0.32
+  GLOW_RADIUS=14
+  GLOW_THRESHOLD=0.65
+  SOFTNESS=2
   WORKERS=<half the available CPUs>
   SEED=0                       # zero generates and records a time-based seed
 
@@ -56,14 +61,19 @@ if [[ ${1:-} == "--" ]]; then shift; fi
 count=${COUNT:-1000}
 width=${WIDTH:-2048}
 height=${HEIGHT:-2048}
-iterations=${ITERATIONS:-100000000}
+iterations=${ITERATIONS:-200000000}
 screen_iterations=${SCREEN_ITERATIONS:-200000}
 screen_size=${SCREEN_SIZE:-256}
 min_score=${MIN_SCORE:-0.80}
 max_score=${MAX_SCORE:-1.0}
-gamma=${GAMMA:-2.2}
-exposure=${EXPOSURE:-2.5}
-white_percentile=${WHITE_PERCENTILE:-99.5}
+gamma=${GAMMA:-1.8}
+exposure=${EXPOSURE:-0.9}
+white_percentile=${WHITE_PERCENTILE:-99.7}
+supersample=${SUPERSAMPLE:-3}
+glow_strength=${GLOW_STRENGTH:-0.32}
+glow_radius=${GLOW_RADIUS:-14}
+glow_threshold=${GLOW_THRESHOLD:-0.65}
+softness=${SOFTNESS:-2}
 workers=${WORKERS:-$default_workers}
 seed=${SEED:-0}
 
@@ -101,6 +111,11 @@ go run . \
     -gamma "$gamma" \
     -exposure "$exposure" \
     -white-percentile "$white_percentile" \
+    -supersample "$supersample" \
+    -glow-strength "$glow_strength" \
+    -glow-radius "$glow_radius" \
+    -glow-threshold "$glow_threshold" \
+    -softness "$softness" \
     "$@"
 
 printf 'Complete: %s\n' "$output_dir"

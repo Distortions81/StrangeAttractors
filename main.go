@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const programVersion = "0.3.0"
+const programVersion = "0.4.0"
 
 type coefficients struct {
 	A float64 `json:"a"`
@@ -94,6 +94,11 @@ type metadata struct {
 	Palette          string          `json:"palette"`
 	Exposure         float64         `json:"exposure"`
 	WhitePercentile  float64         `json:"white_percentile"`
+	Supersample      int             `json:"supersample"`
+	GlowStrength     float64         `json:"glow_strength"`
+	GlowRadius       int             `json:"glow_radius"`
+	GlowThreshold    float64         `json:"glow_threshold"`
+	Softness         int             `json:"softness"`
 }
 
 type batchEntry struct {
@@ -129,6 +134,11 @@ type batchMetadata struct {
 	Palette          string          `json:"palette"`
 	Exposure         float64         `json:"exposure"`
 	WhitePercentile  float64         `json:"white_percentile"`
+	Supersample      int             `json:"supersample"`
+	GlowStrength     float64         `json:"glow_strength"`
+	GlowRadius       int             `json:"glow_radius"`
+	GlowThreshold    float64         `json:"glow_threshold"`
+	Softness         int             `json:"softness"`
 }
 
 type config struct {
@@ -149,6 +159,11 @@ type config struct {
 	gamma            float64
 	exposure         float64
 	whitePercentile  float64
+	supersample      int
+	glowStrength     float64
+	glowRadius       int
+	glowThreshold    float64
+	softness         int
 }
 
 func main() {
@@ -175,9 +190,14 @@ func parseFlags() config {
 	flag.IntVar(&cfg.workers, "workers", max(1, runtime.NumCPU()/2), "parallel render workers in batch mode")
 	flag.Float64Var(&cfg.minScore, "min-score", 0, "minimum stable screening score accepted in batch mode")
 	flag.Float64Var(&cfg.maxScore, "max-score", 1, "maximum stable screening score accepted in batch mode")
-	flag.Float64Var(&cfg.gamma, "gamma", 2.2, "density-to-image gamma; larger values reveal fainter structure")
-	flag.Float64Var(&cfg.exposure, "exposure", 2.5, "HDR exposure before filmic tone mapping")
-	flag.Float64Var(&cfg.whitePercentile, "white-percentile", 99.5, "nonzero density percentile mapped near white")
+	flag.Float64Var(&cfg.gamma, "gamma", 1.8, "density-to-image gamma; larger values reveal fainter structure")
+	flag.Float64Var(&cfg.exposure, "exposure", 0.9, "HDR exposure before filmic tone mapping")
+	flag.Float64Var(&cfg.whitePercentile, "white-percentile", 99.7, "nonzero density percentile mapped near white")
+	flag.IntVar(&cfg.supersample, "supersample", 3, "linear density supersampling factor")
+	flag.Float64Var(&cfg.glowStrength, "glow-strength", 0.32, "linear-light glow mixed into intense areas; zero disables")
+	flag.IntVar(&cfg.glowRadius, "glow-radius", 14, "glow blur radius in output pixels")
+	flag.Float64Var(&cfg.glowThreshold, "glow-threshold", 0.65, "glow starts at this multiple of the density white point")
+	flag.IntVar(&cfg.softness, "softness", 2, "small linear-density smoothing passes before tone mapping")
 	flag.Parse()
 	return cfg
 }
@@ -210,11 +230,12 @@ func run(cfg config) error {
 	if err := ensureParent(pngPath); err != nil {
 		return err
 	}
-	density, _, err := buildDensity32(best.Coefficients, cfg.burnIn, cfg.iterations, cfg.width, cfg.height)
+	densityWidth, densityHeight := cfg.width*cfg.supersample, cfg.height*cfg.supersample
+	density, _, err := buildDensity64(best.Coefficients, cfg.burnIn, cfg.iterations, densityWidth, densityHeight)
 	if err != nil {
 		return fmt.Errorf("final density: %w", err)
 	}
-	if err := writePNG16HDR(pngPath, density, cfg.width, cfg.height, cfg.gamma, cfg.exposure, cfg.whitePercentile); err != nil {
+	if err := writePNG16GlowHDR(pngPath, density, densityWidth, densityHeight, cfg.supersample, cfg.softness, cfg.gamma, cfg.exposure, cfg.whitePercentile, cfg.glowStrength, cfg.glowRadius, cfg.glowThreshold); err != nil {
 		return err
 	}
 	meta := metadata{
@@ -223,8 +244,10 @@ func run(cfg config) error {
 		Width: cfg.width, Height: cfg.height, CoefficientRange: cfg.coefficientRange,
 		Coefficients: best.Coefficients, Bounds: best.Bounds, Metrics: best.Metrics,
 		Rejections: rejects, PNG: filepath.Base(pngPath),
-		Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32, ToneMap: "aces-fitted",
-		Palette: "aurora", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
+		Gamma: cfg.gamma, BitDepth: 16, DensityBits: 64, ToneMap: "aces-glow-unclipped",
+		Palette: "deep-space", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
+		Supersample: cfg.supersample, GlowStrength: cfg.glowStrength, GlowRadius: cfg.glowRadius, GlowThreshold: cfg.glowThreshold,
+		Softness: cfg.softness,
 	}
 	if err := writeJSON(jsonPath, meta); err != nil {
 		return err
@@ -265,6 +288,18 @@ func validateConfig(cfg config) error {
 		return errors.New("exposure must be positive")
 	case cfg.whitePercentile <= 0 || cfg.whitePercentile > 100:
 		return errors.New("white-percentile must be in (0, 100]")
+	case cfg.supersample < 1 || cfg.supersample > 4:
+		return errors.New("supersample must be between 1 and 4")
+	case cfg.width > int(^uint(0)>>1)/cfg.supersample || cfg.height > int(^uint(0)>>1)/cfg.supersample:
+		return errors.New("supersampled dimensions overflow")
+	case cfg.glowStrength < 0:
+		return errors.New("glow-strength must not be negative")
+	case cfg.glowRadius < 0:
+		return errors.New("glow-radius must not be negative")
+	case cfg.glowThreshold < 0:
+		return errors.New("glow-threshold must not be negative")
+	case cfg.softness < 0 || cfg.softness > 8:
+		return errors.New("softness must be between 0 and 8")
 	}
 	return nil
 }
@@ -295,11 +330,12 @@ func runBatch(rng *rand.Rand, cfg config) error {
 			defer wg.Done()
 			for i := range jobs {
 				c := &candidates[i]
-				density, renderBounds, renderErr := buildDensity32(c.Coefficients, cfg.burnIn, cfg.iterations, cfg.width, cfg.height)
+				densityWidth, densityHeight := cfg.width*cfg.supersample, cfg.height*cfg.supersample
+				density, renderBounds, renderErr := buildDensity64(c.Coefficients, cfg.burnIn, cfg.iterations, densityWidth, densityHeight)
 				if renderErr == nil {
 					c.Bounds = renderBounds
 					c.TempPNG = filepath.Join(stageDir, fmt.Sprintf("candidate-%06d.png", c.Index))
-					renderErr = writePNG16HDR(c.TempPNG, density, cfg.width, cfg.height, cfg.gamma, cfg.exposure, cfg.whitePercentile)
+					renderErr = writePNG16GlowHDR(c.TempPNG, density, densityWidth, densityHeight, cfg.supersample, cfg.softness, cfg.gamma, cfg.exposure, cfg.whitePercentile, cfg.glowStrength, cfg.glowRadius, cfg.glowThreshold)
 				}
 				if renderErr != nil {
 					select {
@@ -347,8 +383,10 @@ func runBatch(rng *rand.Rand, cfg config) error {
 			Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width, Height: cfg.height,
 			CoefficientRange: cfg.coefficientRange, Coefficients: c.Coefficients, Bounds: c.Bounds,
 			Metrics: c.Metrics, PNG: filepath.Base(pngPath), Rank: rank, CandidateIndex: c.Index,
-			ScreenMetrics: &c.ScreenMetrics, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
-			ToneMap: "aces-fitted", Palette: "aurora", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
+			ScreenMetrics: &c.ScreenMetrics, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 64,
+			ToneMap: "aces-glow-unclipped", Palette: "deep-space", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
+			Supersample: cfg.supersample, GlowStrength: cfg.glowStrength, GlowRadius: cfg.glowRadius, GlowThreshold: cfg.glowThreshold,
+			Softness: cfg.softness,
 		}
 		if err := writeJSON(jsonPath, meta); err != nil {
 			return err
@@ -366,8 +404,10 @@ func runBatch(rng *rand.Rand, cfg config) error {
 		Attempts: attempts, Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width,
 		Height: cfg.height, CoefficientRange: cfg.coefficientRange, Rejections: rejects, Entries: entries,
 		MinScore: cfg.minScore, MaxScore: cfg.maxScore, ScreenIterations: cfg.screenIters,
-		ScreenSize: cfg.screenSize, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 32,
-		ToneMap: "aces-fitted", Palette: "aurora", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
+		ScreenSize: cfg.screenSize, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 64,
+		ToneMap: "aces-glow-unclipped", Palette: "deep-space", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
+		Supersample: cfg.supersample, GlowStrength: cfg.glowStrength, GlowRadius: cfg.glowRadius, GlowThreshold: cfg.glowThreshold,
+		Softness: cfg.softness,
 	}
 	if err := writeJSON(filepath.Join(cfg.output, "batch.json"), summary); err != nil {
 		return err
@@ -580,16 +620,15 @@ func buildHistogram(p coefficients, burnIn, iterations, width, height int) ([]ui
 	return counts, b, nil
 }
 
-// buildDensity32 accumulates a high-quality density field. Each orbit point is
-// distributed across four neighboring pixels with six bits of subpixel weight.
-// With the validated interestingness band this leaves ample uint32 headroom
-// while reducing the hard, grainy edges caused by nearest-pixel binning.
-func buildDensity32(p coefficients, burnIn, iterations, width, height int) ([]uint32, bounds, error) {
+// buildDensity64 uses sixteen-bit bilinear weights. It is normally called on a
+// supersampled grid, then reduced in linear density space before tone mapping.
+// The uint64 accumulator preserves extreme knots without saturation.
+func buildDensity64(p coefficients, burnIn, iterations, width, height int) ([]uint64, bounds, error) {
 	b, err := orbitBounds(p, burnIn, iterations)
 	if err != nil {
 		return nil, bounds{}, err
 	}
-	density := make([]uint32, width*height)
+	density := make([]uint64, width*height)
 	x, y := 0.1, 0.1
 	for i := 0; i < burnIn+iterations; i++ {
 		x, y = clifford(p, x, y)
@@ -603,24 +642,19 @@ func buildDensity32(p coefficients, burnIn, iterations, width, height int) ([]ui
 			continue
 		}
 		dx, dy := fx-float64(x0), fy-float64(y0)
-		addDensity(density, width, height, x0, y0, uint32(math.Round(64*(1-dx)*(1-dy))))
-		addDensity(density, width, height, x0+1, y0, uint32(math.Round(64*dx*(1-dy))))
-		addDensity(density, width, height, x0, y0+1, uint32(math.Round(64*(1-dx)*dy)))
-		addDensity(density, width, height, x0+1, y0+1, uint32(math.Round(64*dx*dy)))
+		addDensity(density, width, height, x0, y0, uint64(math.Round(65536*(1-dx)*(1-dy))))
+		addDensity(density, width, height, x0+1, y0, uint64(math.Round(65536*dx*(1-dy))))
+		addDensity(density, width, height, x0, y0+1, uint64(math.Round(65536*(1-dx)*dy)))
+		addDensity(density, width, height, x0+1, y0+1, uint64(math.Round(65536*dx*dy)))
 	}
 	return density, b, nil
 }
 
-func addDensity(density []uint32, width, height, x, y int, weight uint32) {
+func addDensity(density []uint64, width, height, x, y int, weight uint64) {
 	if weight == 0 || x < 0 || x >= width || y < 0 || y >= height {
 		return
 	}
-	i := y*width + x
-	if ^uint32(0)-density[i] < weight {
-		density[i] = ^uint32(0)
-	} else {
-		density[i] += weight
-	}
+	density[y*width+x] += weight
 }
 
 func scoreHistogram(counts []uint64, width, height int, lyapunov float64) metrics {
@@ -816,9 +850,11 @@ func writePNG(path string, counts []uint64, width, height int) error {
 	return nil
 }
 
-func writePNG16HDR(path string, density []uint32, width, height int, gamma, exposure, whitePercentile float64) error {
-	var maxDensity uint32
-	for _, n := range density {
+func writePNG16GlowHDR(path string, density []uint64, densityWidth, densityHeight, supersample, softness int, gamma, exposure, whitePercentile, glowStrength float64, glowRadius int, glowThreshold float64) error {
+	linear, width, height := downsampleDensity(density, densityWidth, densityHeight, supersample)
+	linear = softenDensity(linear, width, height, softness)
+	var maxDensity float64
+	for _, n := range linear {
 		if n > maxDensity {
 			maxDensity = n
 		}
@@ -826,22 +862,46 @@ func writePNG16HDR(path string, density []uint32, width, height int, gamma, expo
 	if maxDensity == 0 {
 		return errors.New("cannot render empty density")
 	}
-	whitePoint := densityPercentile(density, maxDensity, whitePercentile/100)
+	whitePoint := densityPercentile(linear, maxDensity, whitePercentile/100)
+
+	glow := make([]float32, len(linear))
+	if glowStrength > 0 && glowRadius > 0 {
+		for i, n := range linear {
+			relative := n / whitePoint
+			if relative > glowThreshold {
+				glow[i] = float32(relative - glowThreshold)
+			}
+		}
+		glow = gaussianApproximation(glow, width, height, glowRadius)
+	}
+
+	var maxSignal float64
+	for i, n := range linear {
+		signal := n/whitePoint + glowStrength*float64(glow[i])
+		if signal > maxSignal {
+			maxSignal = signal
+		}
+	}
 	const lutSize = 65536
 	lut := make([]uint16, lutSize)
 	invGamma := 1 / gamma
 	for i := 1; i < lutSize; i++ {
-		linear := float64(i) / float64(lutSize-1) * exposure
-		mapped := acesToneMap(linear)
+		// Square-root indexing gives faint densities much more LUT precision while
+		// retaining the complete, unclipped highlight range through the filmic curve.
+		t := float64(i) / float64(lutSize-1)
+		signal := t * t * maxSignal
+		mapped := acesToneMap(signal * exposure)
 		lut[i] = uint16(math.Round(65535 * math.Pow(mapped, invGamma)))
 	}
 	img := image.NewRGBA64(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			n := density[y*width+x]
-			index := uint32(min(uint64(lutSize-1), uint64(n)*(lutSize-1)/uint64(whitePoint)))
+			i := y*width + x
+			signal := linear[i]/whitePoint + glowStrength*float64(glow[i])
+			index := int(math.Round(math.Sqrt(signal/maxSignal) * (lutSize - 1)))
+			index = max(0, min(lutSize-1, index))
 			v := float64(lut[index]) / 65535
-			img.SetRGBA64(x, y, auroraPalette(v))
+			img.SetRGBA64(x, y, deepSpacePalette(v))
 		}
 	}
 	f, err := os.Create(path)
@@ -858,7 +918,50 @@ func writePNG16HDR(path string, density []uint32, width, height int, gamma, expo
 	return nil
 }
 
-func densityPercentile(density []uint32, maxDensity uint32, percentile float64) uint32 {
+func softenDensity(source []float64, width, height, passes int) []float64 {
+	if passes == 0 {
+		return source
+	}
+	current := source
+	scratch := make([]float64, len(source))
+	for pass := 0; pass < passes; pass++ {
+		for y := 0; y < height; y++ {
+			row := y * width
+			for x := 0; x < width; x++ {
+				left, right := max(0, x-1), min(width-1, x+1)
+				scratch[row+x] = (current[row+left] + 2*current[row+x] + current[row+right]) / 4
+			}
+		}
+		for y := 0; y < height; y++ {
+			top, bottom := max(0, y-1), min(height-1, y+1)
+			for x := 0; x < width; x++ {
+				current[y*width+x] = (scratch[top*width+x] + 2*scratch[y*width+x] + scratch[bottom*width+x]) / 4
+			}
+		}
+	}
+	return current
+}
+
+func downsampleDensity(density []uint64, sourceWidth, sourceHeight, factor int) ([]float64, int, int) {
+	width, height := sourceWidth/factor, sourceHeight/factor
+	result := make([]float64, width*height)
+	normalization := 1 / float64(factor*factor)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			var sum uint64
+			for sy := 0; sy < factor; sy++ {
+				row := (y*factor+sy)*sourceWidth + x*factor
+				for sx := 0; sx < factor; sx++ {
+					sum += density[row+sx]
+				}
+			}
+			result[y*width+x] = float64(sum) * normalization
+		}
+	}
+	return result, width, height
+}
+
+func densityPercentile(density []float64, maxDensity, percentile float64) float64 {
 	const bins = 65536
 	histogram := make([]uint64, bins)
 	var nonzero uint64
@@ -866,7 +969,8 @@ func densityPercentile(density []uint32, maxDensity uint32, percentile float64) 
 		if n == 0 {
 			continue
 		}
-		index := uint32(uint64(n) * (bins - 1) / uint64(maxDensity))
+		index := int(n / maxDensity * (bins - 1))
+		index = max(0, min(bins-1, index))
 		histogram[index]++
 		nonzero++
 	}
@@ -875,10 +979,63 @@ func densityPercentile(density []uint32, maxDensity uint32, percentile float64) 
 	for i, n := range histogram {
 		cumulative += n
 		if cumulative >= target {
-			return max(1, uint32(uint64(i)*uint64(maxDensity)/(bins-1)))
+			return math.Max(maxDensity/float64(bins-1), float64(i)*maxDensity/float64(bins-1))
 		}
 	}
 	return maxDensity
+}
+
+// gaussianApproximation applies three separable box blurs, a close and much
+// faster approximation to a Gaussian for large 2048px batches.
+func gaussianApproximation(source []float32, width, height, radius int) []float32 {
+	current := source
+	scratch := make([]float32, len(source))
+	for pass := 0; pass < 3; pass++ {
+		boxBlurHorizontal(current, scratch, width, height, radius)
+		boxBlurVertical(scratch, current, width, height, radius)
+	}
+	return current
+}
+
+func boxBlurHorizontal(source, target []float32, width, height, radius int) {
+	for y := 0; y < height; y++ {
+		row := y * width
+		var sum float64
+		for x := 0; x < min(width, radius+1); x++ {
+			sum += float64(source[row+x])
+		}
+		for x := 0; x < width; x++ {
+			left, right := x-radius, x+radius
+			if left > 0 {
+				sum -= float64(source[row+left-1])
+			}
+			if right < width-1 {
+				sum += float64(source[row+right+1])
+			}
+			count := min(width-1, right) - max(0, left) + 1
+			target[row+x] = float32(sum / float64(count))
+		}
+	}
+}
+
+func boxBlurVertical(source, target []float32, width, height, radius int) {
+	for x := 0; x < width; x++ {
+		var sum float64
+		for y := 0; y < min(height, radius+1); y++ {
+			sum += float64(source[y*width+x])
+		}
+		for y := 0; y < height; y++ {
+			top, bottom := y-radius, y+radius
+			if top > 0 {
+				sum -= float64(source[(top-1)*width+x])
+			}
+			if bottom < height-1 {
+				sum += float64(source[(bottom+1)*width+x])
+			}
+			count := min(height-1, bottom) - max(0, top) + 1
+			target[y*width+x] = float32(sum / float64(count))
+		}
+	}
 }
 
 func acesToneMap(x float64) float64 {
@@ -888,16 +1045,16 @@ func acesToneMap(x float64) float64 {
 
 type colorStop struct{ Position, R, G, B float64 }
 
-func auroraPalette(v float64) color.RGBA64 {
+func deepSpacePalette(v float64) color.RGBA64 {
 	stops := [...]colorStop{
-		{0.00, 0.012, 0.020, 0.047},
-		{0.08, 0.025, 0.035, 0.160},
-		{0.24, 0.180, 0.075, 0.520},
-		{0.42, 0.035, 0.360, 1.000},
-		{0.62, 0.020, 0.920, 0.940},
-		{0.78, 0.480, 1.000, 0.760},
-		{0.91, 1.000, 0.620, 0.160},
-		{1.00, 1.000, 0.985, 0.900},
+		{0.00, 0.006, 0.009, 0.026},
+		{0.10, 0.018, 0.022, 0.105},
+		{0.25, 0.070, 0.060, 0.300},
+		{0.43, 0.035, 0.260, 0.560},
+		{0.60, 0.025, 0.590, 0.680},
+		{0.75, 0.240, 0.800, 0.650},
+		{0.88, 0.900, 0.570, 0.270},
+		{1.00, 1.000, 0.950, 0.790},
 	}
 	if v <= 0 {
 		return rgba64(stops[0].R, stops[0].G, stops[0].B)

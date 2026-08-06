@@ -50,7 +50,7 @@ For the tuned 2048×2048 HDR workflow, use the bundled script:
 scripts/generate-hdr-batch.sh
 ```
 
-It defaults to 1,000 images, 100 million samples per image, score `0.80–1.00`,
+It defaults to 1,000 images, 200 million samples per image, score `0.80–1.00`,
 and a timestamped directory under `output/`. Its settings can be overridden by
 environment variables or trailing Go flags:
 
@@ -62,12 +62,15 @@ COUNT=20 scripts/generate-hdr-batch.sh output/test -- -exposure 3.0
 The script refuses to write into a nonempty directory and removes its temporary
 staging directory if interrupted. Completed output remains untouched.
 
-Final images use 32-bit density buffers with subpixel splatting. A robust
-nonzero-density percentile establishes the white point, an ACES-style filmic
-curve compresses highlights, and a gamma LUT feeds a 16-bit aurora palette from
-indigo through cyan to warm highlights. PNG does not support 32-bit integer
-channels; the 32-bit values are retained as accumulation precision before tone
-mapping.
+Final images use 64-bit density buffers with 16-bit bilinear weights on a 3×
+supersampled grid, then downsample in linear density space. A robust nonzero
+density percentile establishes the white point without clipping values above
+it. Two gentle binomial reconstruction passes soften pixel-scale texture before
+bright knots seed a broad linear-light glow and an ACES-style filmic curve
+and gamma LUT feed a cinematic 16-bit palette with indigo shadows, cyan/teal
+midtones, and warm highlights. The wide accumulator
+and unclipped tone curve preserve very intense regions instead of flattening
+them into one color.
 
 For a quick preview:
 
@@ -90,9 +93,14 @@ Useful flags:
 | `-count` | 1 | accepted attractors to render; values above 1 enable ranked batch mode |
 | `-workers` | half available CPUs | concurrent batch renderers |
 | `-min-score`, `-max-score` | 0, 1 | accepted batch screening-score interval |
-| `-gamma` | 2.2 | density tone-map gamma; larger values reveal faint details |
-| `-exposure` | 2.5 | exposure applied before the filmic curve |
-| `-white-percentile` | 99.5 | nonzero density percentile used as the HDR white point |
+| `-gamma` | 1.8 | density tone-map gamma; larger values reveal faint details |
+| `-exposure` | 0.9 | exposure applied before the filmic curve |
+| `-white-percentile` | 99.7 | nonzero density percentile used as the HDR white point |
+| `-supersample` | 3 | linear-density supersampling factor |
+| `-glow-strength` | 0.32 | intensity of highlight-driven glow |
+| `-glow-radius` | 14 | glow radius in output pixels |
+| `-glow-threshold` | 0.65 | glow onset relative to the density white point |
+| `-softness` | 2 | linear-density reconstruction smoothing passes |
 
 ## Selection heuristic
 

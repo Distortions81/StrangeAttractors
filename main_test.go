@@ -86,7 +86,7 @@ func TestSearchIsDeterministic(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1, count: 1, workers: 1, maxScore: 1, gamma: 2.2, exposure: 2.5, whitePercentile: 99.5}
+	valid := config{output: "x", width: 2, height: 2, iterations: 100, samples: 1, screenIters: 100, screenSize: 8, coefficientRange: 1, count: 1, workers: 1, maxScore: 1, gamma: 1.8, exposure: 0.9, whitePercentile: 99.7, supersample: 3, glowStrength: 0.32, glowRadius: 14, glowThreshold: 0.65, softness: 2}
 	if err := validateConfig(valid); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestCollectCandidatesReturnsRequestedCount(t *testing.T) {
 }
 
 func TestDensitySplat(t *testing.T) {
-	density := make([]uint32, 4)
+	density := make([]uint64, 4)
 	addDensity(density, 2, 2, 0, 0, 10)
 	addDensity(density, 2, 2, 1, 1, 20)
 	addDensity(density, 2, 2, -1, 0, 30)
@@ -126,10 +126,49 @@ func TestDensitySplat(t *testing.T) {
 }
 
 func TestDensityPercentileIgnoresHotPixel(t *testing.T) {
-	density := []uint32{0, 10, 10, 10, 10, 10000}
+	density := []float64{0, 10, 10, 10, 10, 10000}
 	white := densityPercentile(density, 10000, 0.8)
 	if white < 9 || white > 11 {
-		t.Fatalf("white point = %d, want approximately 10", white)
+		t.Fatalf("white point = %g, want approximately 10", white)
+	}
+}
+
+func TestDownsampleDensity(t *testing.T) {
+	source := []uint64{4, 4, 8, 8, 4, 4, 8, 8, 12, 12, 16, 16, 12, 12, 16, 16}
+	got, width, height := downsampleDensity(source, 4, 4, 2)
+	want := []float64{4, 8, 12, 16}
+	if width != 2 || height != 2 {
+		t.Fatalf("size = %dx%d", width, height)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("density[%d] = %g, want %g", i, got[i], want[i])
+		}
+	}
+}
+
+func TestGlowSpreadsHighlight(t *testing.T) {
+	source := make([]float32, 25)
+	source[12] = 1
+	got := gaussianApproximation(source, 5, 5, 1)
+	if got[12] <= 0 || got[11] <= 0 || got[7] <= 0 {
+		t.Fatalf("glow did not spread: %v", got)
+	}
+}
+
+func TestSoftnessPreservesMass(t *testing.T) {
+	source := make([]float64, 25)
+	source[12] = 16
+	got := softenDensity(source, 5, 5, 2)
+	var sum float64
+	for _, n := range got {
+		sum += n
+	}
+	if math.Abs(sum-16) > 1e-12 {
+		t.Fatalf("softening changed mass to %g", sum)
+	}
+	if got[12] >= 16 || got[11] <= 0 {
+		t.Fatalf("softening did not spread center: %v", got)
 	}
 }
 
