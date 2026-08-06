@@ -166,6 +166,10 @@ type config struct {
 	glowRadius       int
 	glowThreshold    float64
 	softness         int
+	evolveFrames     int
+	evolveOffspring  int
+	evolveMutation   float64
+	evolveMinScore   float64
 }
 
 func main() {
@@ -200,6 +204,10 @@ func parseFlags() config {
 	flag.IntVar(&cfg.glowRadius, "glow-radius", 14, "glow blur radius in output pixels")
 	flag.Float64Var(&cfg.glowThreshold, "glow-threshold", 0.65, "glow starts at this multiple of the density white point")
 	flag.IntVar(&cfg.softness, "softness", 2, "small linear-density smoothing passes before tone mapping")
+	flag.IntVar(&cfg.evolveFrames, "evolve-frames", 0, "generate a coherent evolutionary PNG sequence")
+	flag.IntVar(&cfg.evolveOffspring, "evolve-offspring", 48, "mutated descendants evaluated for each evolution frame")
+	flag.Float64Var(&cfg.evolveMutation, "evolve-mutation", 0.035, "coefficient mutation standard deviation per frame")
+	flag.Float64Var(&cfg.evolveMinScore, "evolve-min-score", 0.65, "minimum visual score for every selected descendant")
 	flag.Parse()
 	return cfg
 }
@@ -212,6 +220,9 @@ func run(cfg config) error {
 		cfg.seed = time.Now().UnixNano()
 	}
 	rng := rand.New(rand.NewSource(cfg.seed))
+	if cfg.evolveFrames > 0 {
+		return runEvolution(rng, cfg)
+	}
 	if cfg.count > 1 {
 		return runBatch(rng, cfg)
 	}
@@ -295,6 +306,14 @@ func validateConfig(cfg config) error {
 		return errors.New("glow-threshold must not be negative")
 	case cfg.softness < 0 || cfg.softness > 8:
 		return errors.New("softness must be between 0 and 8")
+	case cfg.evolveFrames < 0 || cfg.evolveFrames == 1:
+		return errors.New("evolve-frames must be zero or at least 2")
+	case cfg.evolveFrames > 0 && cfg.evolveOffspring < 1:
+		return errors.New("evolve-offspring must be at least 1")
+	case cfg.evolveFrames > 0 && cfg.evolveMutation <= 0:
+		return errors.New("evolve-mutation must be positive")
+	case cfg.evolveFrames > 0 && (cfg.evolveMinScore < 0 || cfg.evolveMinScore > 1):
+		return errors.New("evolve-min-score must be between 0 and 1")
 	}
 	return nil
 }

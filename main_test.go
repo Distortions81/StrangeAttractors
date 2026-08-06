@@ -96,6 +96,52 @@ func TestValidateConfig(t *testing.T) {
 	}
 }
 
+func TestMutateCoefficientsIsDeterministicAndClamped(t *testing.T) {
+	parent := coefficients{A: 0.9, B: -0.9, C: 0.5, D: -0.5}
+	velocity := coefficients{A: 1, B: -1, C: 0.2, D: -0.2}
+	a := mutateCoefficients(rand.New(rand.NewSource(42)), parent, velocity, 0.1, 1)
+	b := mutateCoefficients(rand.New(rand.NewSource(42)), parent, velocity, 0.1, 1)
+	if a != b {
+		t.Fatalf("same seed produced different mutations: %+v and %+v", a, b)
+	}
+	for _, value := range []float64{a.A, a.B, a.C, a.D} {
+		if value < -1 || value > 1 {
+			t.Fatalf("mutation escaped coefficient range: %+v", a)
+		}
+	}
+}
+
+func TestDescriptorDistance(t *testing.T) {
+	m := metrics{Occupancy: 0.2, GlobalEntropy: 0.4, BoxDimension: 1.7, LyapunovExponent: 0.3}
+	if got := descriptorDistance(m, m); got != 0 {
+		t.Fatalf("self distance = %g, want 0", got)
+	}
+}
+
+func TestSmoothEvolutionBounds(t *testing.T) {
+	input := []bounds{
+		{MinX: -1, MaxX: 1, MinY: -1, MaxY: 1},
+		{MinX: 0, MaxX: 4, MinY: -2, MaxY: 2},
+		{MinX: 1, MaxX: 3, MinY: -1, MaxY: 1},
+	}
+	got := smoothEvolutionBounds(input, 1)
+	if len(got) != len(input) {
+		t.Fatalf("got %d bounds, want %d", len(got), len(input))
+	}
+	if got[1].MaxX-got[1].MinX >= input[1].MaxX-input[1].MinX {
+		t.Fatalf("center-frame width was not softened: %+v", got[1])
+	}
+	center := (got[1].MinX + got[1].MaxX) / 2
+	if math.Abs(center-1.5) > 1e-12 {
+		t.Fatalf("smoothed center = %g, want 1.5", center)
+	}
+	for i, b := range got {
+		if b.MinX >= b.MaxX || b.MinY >= b.MaxY {
+			t.Fatalf("invalid smoothed bounds %d: %+v", i, b)
+		}
+	}
+}
+
 func TestCollectCandidatesReturnsRequestedCount(t *testing.T) {
 	cfg := config{count: 3, burnIn: 50, screenIters: 1000, screenSize: 32, coefficientRange: 3, maxScore: 1}
 	got, _, attempts, err := collectCandidates(rand.New(rand.NewSource(42)), cfg)

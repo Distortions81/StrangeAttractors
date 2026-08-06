@@ -63,6 +63,37 @@ The script refuses to write into a nonempty directory. Ranked PNG/JSON pairs are
 written directly into the requested folder as workers finish, so progress is
 visible and completed output remains available if the run is interrupted.
 
+## Evolution sequences
+
+Generate a coherent lineage of nearby attractors as numbered PNG frames:
+
+```sh
+scripts/generate-evolution.sh
+```
+
+Each frame is selected from viable mutations of the previous frame. Selection
+balances visual-interest score with novelty relative to the recent lineage,
+while coefficient momentum and a temporally smoothed camera keep the motion
+continuous. Evolution screening waits through a full extra screening window,
+preventing long transients that later collapse into a periodic cycle from
+entering the lineage. The default run produces 240 high-quality 2048x2048
+frames. Use a smaller preview before committing to a full render:
+
+```sh
+FRAMES=24 WIDTH=512 HEIGHT=512 ITERATIONS=2000000 \
+  scripts/generate-evolution.sh output/evolution-preview
+```
+
+Frames are named `frame-000000_score-0.712345.png`; matching JSON files capture
+the parent, mutation distance, raw and smoothed framing, coefficients, score,
+and render settings. `evolution.json` indexes the complete lineage. To make a
+10-bit HEVC movie at 30 fps from inside its output directory:
+
+```sh
+ffmpeg -framerate 30 -pattern_type glob -i 'frame-*.png' \
+  -c:v libx265 -pix_fmt yuv420p10le evolution.mp4
+```
+
 Final images use 64-bit density buffers with 16-bit bilinear weights on a 3×
 supersampled grid, then downsample in linear density space. A robust nonzero
 density percentile establishes the white point without clipping values above
@@ -102,6 +133,10 @@ Useful flags:
 | `-glow-radius` | 14 | glow radius in output pixels |
 | `-glow-threshold` | 0.65 | glow onset relative to the density white point |
 | `-softness` | 2 | linear-density reconstruction smoothing passes |
+| `-evolve-frames` | 0 | numbered lineage frames; zero disables evolution mode |
+| `-evolve-offspring` | 48 | viable mutations considered for each next frame |
+| `-evolve-mutation` | 0.035 | coefficient mutation scale per frame |
+| `-evolve-min-score` | 0.65 | minimum visual score retained throughout the lineage |
 
 ## Selection heuristic
 
