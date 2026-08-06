@@ -59,8 +59,9 @@ SEED=42 WORKERS=12 scripts/generate-hdr-batch.sh output/my-hdr-batch
 COUNT=20 scripts/generate-hdr-batch.sh output/test -- -exposure 3.0
 ```
 
-The script refuses to write into a nonempty directory and removes its temporary
-staging directory if interrupted. Completed output remains untouched.
+The script refuses to write into a nonempty directory. Ranked PNG/JSON pairs are
+written directly into the requested folder as workers finish, so progress is
+visible and completed output remains available if the run is interrupted.
 
 Final images use 64-bit density buffers with 16-bit bilinear weights on a 3×
 supersampled grid, then downsample in linear density space. A robust nonzero

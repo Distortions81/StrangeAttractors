@@ -59,7 +59,9 @@ type candidate struct {
 	Metrics       metrics
 	ScreenMetrics metrics
 	Index         int
-	TempPNG       string
+	Rank          int
+	PNGPath       string
+	JSONPath      string
 }
 
 type rejectionCounts struct {
@@ -301,17 +303,25 @@ func runBatch(rng *rand.Rand, cfg config) error {
 	if err := os.MkdirAll(cfg.output, 0o755); err != nil {
 		return fmt.Errorf("create batch directory: %w", err)
 	}
-	stageDir, err := os.MkdirTemp(cfg.output, ".rendering-")
-	if err != nil {
-		return fmt.Errorf("create staging directory: %w", err)
-	}
-
 	candidates, rejects, attempts, err := collectCandidates(rng, cfg)
 	if err != nil {
 		return err
 	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].Metrics.Score > candidates[j].Metrics.Score
+	})
+	for i := range candidates {
+		c := &candidates[i]
+		c.Rank = i + 1
+		stem := fmt.Sprintf("%04d_score-%.6f_id-%06d", c.Rank, c.Metrics.Score, c.Index)
+		c.PNGPath, c.JSONPath = filepath.Join(cfg.output, stem+".png"), filepath.Join(cfg.output, stem+".json")
+		if fileExists(c.PNGPath) || fileExists(c.JSONPath) {
+			return fmt.Errorf("refusing to overwrite existing result %s", stem)
+		}
+	}
 	fmt.Printf("accepted %d candidates after %d attempts; rendering with %d workers\n", len(candidates), attempts, min(cfg.workers, cfg.count))
 
+	generatedAt := time.Now().UTC().Format(time.RFC3339)
 	jobs := make(chan int)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
@@ -326,8 +336,20 @@ func runBatch(rng *rand.Rand, cfg config) error {
 				densityWidth, densityHeight := cfg.width*cfg.supersample, cfg.height*cfg.supersample
 				density, renderErr := buildDensity64InBounds(c.Coefficients, c.Bounds, cfg.burnIn, cfg.iterations, densityWidth, densityHeight)
 				if renderErr == nil {
-					c.TempPNG = filepath.Join(stageDir, fmt.Sprintf("candidate-%06d.png", c.Index))
-					renderErr = writePNG16GlowHDR(c.TempPNG, density, densityWidth, densityHeight, cfg.supersample, cfg.softness, cfg.gamma, cfg.exposure, cfg.whitePercentile, cfg.glowStrength, cfg.glowRadius, cfg.glowThreshold)
+					renderErr = writePNG16GlowHDR(c.PNGPath, density, densityWidth, densityHeight, cfg.supersample, cfg.softness, cfg.gamma, cfg.exposure, cfg.whitePercentile, cfg.glowStrength, cfg.glowRadius, cfg.glowThreshold)
+				}
+				if renderErr == nil {
+					meta := metadata{
+						Version: programVersion, GeneratedAt: generatedAt, Seed: cfg.seed, Samples: 1,
+						Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width, Height: cfg.height,
+						CoefficientRange: cfg.coefficientRange, Coefficients: c.Coefficients, Bounds: c.Bounds,
+						Metrics: c.Metrics, PNG: filepath.Base(c.PNGPath), Rank: c.Rank, CandidateIndex: c.Index,
+						ScreenMetrics: &c.ScreenMetrics, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 64,
+						ToneMap: "aces-glow-unclipped", Palette: "deep-space", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
+						Supersample: cfg.supersample, GlowStrength: cfg.glowStrength, GlowRadius: cfg.glowRadius, GlowThreshold: cfg.glowThreshold,
+						Softness: cfg.softness,
+					}
+					renderErr = writeJSON(c.JSONPath, meta)
 				}
 				if renderErr != nil {
 					select {
@@ -354,42 +376,13 @@ func runBatch(rng *rand.Rand, cfg config) error {
 	default:
 	}
 
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].Metrics.Score > candidates[j].Metrics.Score
-	})
 	entries := make([]batchEntry, 0, len(candidates))
-	generatedAt := time.Now().UTC().Format(time.RFC3339)
 	for i := range candidates {
 		c := &candidates[i]
-		rank := i + 1
-		stem := fmt.Sprintf("%04d_score-%.6f_id-%06d", rank, c.Metrics.Score, c.Index)
-		pngPath, jsonPath := filepath.Join(cfg.output, stem+".png"), filepath.Join(cfg.output, stem+".json")
-		if fileExists(pngPath) || fileExists(jsonPath) {
-			return fmt.Errorf("refusing to overwrite existing result %s", stem)
-		}
-		if err := os.Rename(c.TempPNG, pngPath); err != nil {
-			return fmt.Errorf("publish candidate %d: %w", c.Index, err)
-		}
-		meta := metadata{
-			Version: programVersion, GeneratedAt: generatedAt, Seed: cfg.seed, Samples: 1,
-			Iterations: cfg.iterations, BurnIn: cfg.burnIn, Width: cfg.width, Height: cfg.height,
-			CoefficientRange: cfg.coefficientRange, Coefficients: c.Coefficients, Bounds: c.Bounds,
-			Metrics: c.Metrics, PNG: filepath.Base(pngPath), Rank: rank, CandidateIndex: c.Index,
-			ScreenMetrics: &c.ScreenMetrics, Gamma: cfg.gamma, BitDepth: 16, DensityBits: 64,
-			ToneMap: "aces-glow-unclipped", Palette: "deep-space", Exposure: cfg.exposure, WhitePercentile: cfg.whitePercentile,
-			Supersample: cfg.supersample, GlowStrength: cfg.glowStrength, GlowRadius: cfg.glowRadius, GlowThreshold: cfg.glowThreshold,
-			Softness: cfg.softness,
-		}
-		if err := writeJSON(jsonPath, meta); err != nil {
-			return err
-		}
 		entries = append(entries, batchEntry{
-			Rank: rank, CandidateIndex: c.Index, Score: c.Metrics.Score, Coefficients: c.Coefficients,
-			PNG: filepath.Base(pngPath), Metadata: filepath.Base(jsonPath),
+			Rank: c.Rank, CandidateIndex: c.Index, Score: c.Metrics.Score, Coefficients: c.Coefficients,
+			PNG: filepath.Base(c.PNGPath), Metadata: filepath.Base(c.JSONPath),
 		})
-	}
-	if err := os.Remove(stageDir); err != nil {
-		return fmt.Errorf("remove empty staging directory: %w", err)
 	}
 	summary := batchMetadata{
 		Version: programVersion, GeneratedAt: generatedAt, Seed: cfg.seed, Count: cfg.count,

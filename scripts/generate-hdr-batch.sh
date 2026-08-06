@@ -84,14 +84,6 @@ fi
 
 mkdir -p -- "$output_dir"
 
-cleanup_staging() {
-    local stage
-    while IFS= read -r -d '' stage; do
-        rm -rf -- "$stage"
-    done < <(find "$output_dir" -mindepth 1 -maxdepth 1 -type d -name '.rendering-*' -print0 2>/dev/null)
-}
-trap cleanup_staging EXIT INT TERM
-
 printf 'Generating %s ranked %sx%s HDR attractors in %s\n' "$count" "$width" "$height" "$output_dir"
 printf 'Samples/image=%s score=[%s,%s] workers=%s seed=%s\n' "$iterations" "$min_score" "$max_score" "$workers" "$seed"
 
