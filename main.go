@@ -218,20 +218,13 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
-	counts, renderBounds, err := buildHistogram(best.Coefficients, cfg.burnIn, cfg.iterations, cfg.width, cfg.height)
-	if err != nil {
-		return fmt.Errorf("final render: %w", err)
-	}
-	best.Bounds = renderBounds
-	best.Metrics = scoreHistogram(counts, cfg.width, cfg.height, best.Metrics.LyapunovExponent)
-
 	pngPath := cfg.output + ".png"
 	jsonPath := cfg.output + ".json"
 	if err := ensureParent(pngPath); err != nil {
 		return err
 	}
 	densityWidth, densityHeight := cfg.width*cfg.supersample, cfg.height*cfg.supersample
-	density, _, err := buildDensity64(best.Coefficients, cfg.burnIn, cfg.iterations, densityWidth, densityHeight)
+	density, err := buildDensity64InBounds(best.Coefficients, best.Bounds, cfg.burnIn, cfg.iterations, densityWidth, densityHeight)
 	if err != nil {
 		return fmt.Errorf("final density: %w", err)
 	}
@@ -331,9 +324,8 @@ func runBatch(rng *rand.Rand, cfg config) error {
 			for i := range jobs {
 				c := &candidates[i]
 				densityWidth, densityHeight := cfg.width*cfg.supersample, cfg.height*cfg.supersample
-				density, renderBounds, renderErr := buildDensity64(c.Coefficients, cfg.burnIn, cfg.iterations, densityWidth, densityHeight)
+				density, renderErr := buildDensity64InBounds(c.Coefficients, c.Bounds, cfg.burnIn, cfg.iterations, densityWidth, densityHeight)
 				if renderErr == nil {
-					c.Bounds = renderBounds
 					c.TempPNG = filepath.Join(stageDir, fmt.Sprintf("candidate-%06d.png", c.Index))
 					renderErr = writePNG16GlowHDR(c.TempPNG, density, densityWidth, densityHeight, cfg.supersample, cfg.softness, cfg.gamma, cfg.exposure, cfg.whitePercentile, cfg.glowStrength, cfg.glowRadius, cfg.glowThreshold)
 				}
@@ -420,42 +412,84 @@ func collectCandidates(rng *rand.Rand, cfg config) ([]candidate, rejectionCounts
 	candidates := make([]candidate, 0, cfg.count)
 	var rejects rejectionCounts
 	maxAttempts := cfg.count * 100
-	for attempts := 1; attempts <= maxAttempts; attempts++ {
-		p := coefficients{
-			A: uniform(rng, cfg.coefficientRange), B: uniform(rng, cfg.coefficientRange),
-			C: uniform(rng, cfg.coefficientRange), D: uniform(rng, cfg.coefficientRange),
-		}
-		if reason := inspectOrbit(p, cfg.burnIn, cfg.screenIters); reason != "" {
-			if reason == "diverged" {
-				rejects.Diverged++
-			} else {
-				rejects.ShortLoop++
+	batchSize := max(1, cfg.workers*4)
+	for firstAttempt := 1; firstAttempt <= maxAttempts; firstAttempt += batchSize {
+		size := min(batchSize, maxAttempts-firstAttempt+1)
+		parameters := make([]coefficients, size)
+		for i := range parameters {
+			parameters[i] = coefficients{
+				A: uniform(rng, cfg.coefficientRange), B: uniform(rng, cfg.coefficientRange),
+				C: uniform(rng, cfg.coefficientRange), D: uniform(rng, cfg.coefficientRange),
 			}
-			continue
 		}
-		counts, b, histogramErr := buildHistogram(p, cfg.burnIn, cfg.screenIters, cfg.screenSize, cfg.screenSize)
-		if histogramErr != nil {
-			rejects.Diverged++
-			continue
-		}
-		lyapunov := estimateLyapunov(p, cfg.burnIn, min(cfg.screenIters, 50_000))
-		m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize, lyapunov)
-		if m.Occupancy < 0.005 || m.OccupiedBins < 64 {
-			rejects.Sparse++
-			continue
-		}
-		if m.Score < cfg.minScore || m.Score > cfg.maxScore {
-			rejects.OutsideScoreBand++
-			continue
-		}
-		candidates = append(candidates, candidate{
-			Coefficients: p, Bounds: b, Metrics: m, ScreenMetrics: m, Index: len(candidates) + 1,
-		})
-		if len(candidates) == cfg.count {
-			return candidates, rejects, attempts, nil
+		results := evaluateCandidateBatch(parameters, cfg)
+		for i, result := range results {
+			attempt := firstAttempt + i
+			switch result.reason {
+			case "diverged":
+				rejects.Diverged++
+			case "short_loop":
+				rejects.ShortLoop++
+			case "sparse":
+				rejects.Sparse++
+			case "outside_score_band":
+				rejects.OutsideScoreBand++
+			case "":
+				result.candidate.Index = len(candidates) + 1
+				candidates = append(candidates, result.candidate)
+				if len(candidates) == cfg.count {
+					return candidates, rejects, attempt, nil
+				}
+			}
 		}
 	}
 	return nil, rejects, maxAttempts, fmt.Errorf("found only %d usable attractors in %d attempts", len(candidates), maxAttempts)
+}
+
+type candidateEvaluation struct {
+	candidate candidate
+	reason    string
+}
+
+func evaluateCandidateBatch(parameters []coefficients, cfg config) []candidateEvaluation {
+	results := make([]candidateEvaluation, len(parameters))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	workers := min(max(1, cfg.workers), len(parameters))
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				results[i] = evaluateCandidate(parameters[i], cfg)
+			}
+		}()
+	}
+	for i := range parameters {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
+func evaluateCandidate(p coefficients, cfg config) candidateEvaluation {
+	if reason := inspectOrbit(p, cfg.burnIn, cfg.screenIters); reason != "" {
+		return candidateEvaluation{reason: reason}
+	}
+	counts, b, err := buildHistogram(p, cfg.burnIn, cfg.screenIters, cfg.screenSize, cfg.screenSize)
+	if err != nil {
+		return candidateEvaluation{reason: "diverged"}
+	}
+	lyapunov := estimateLyapunov(p, cfg.burnIn, min(cfg.screenIters, 50_000))
+	m := scoreHistogram(counts, cfg.screenSize, cfg.screenSize, lyapunov)
+	if m.Occupancy < 0.005 || m.OccupiedBins < 64 {
+		return candidateEvaluation{reason: "sparse"}
+	}
+	if m.Score < cfg.minScore || m.Score > cfg.maxScore {
+		return candidateEvaluation{reason: "outside_score_band"}
+	}
+	return candidateEvaluation{candidate: candidate{Coefficients: p, Bounds: b, Metrics: m, ScreenMetrics: m}}
 }
 
 func fileExists(path string) bool {
@@ -620,34 +654,35 @@ func buildHistogram(p coefficients, burnIn, iterations, width, height int) ([]ui
 	return counts, b, nil
 }
 
-// buildDensity64 uses sixteen-bit bilinear weights. It is normally called on a
-// supersampled grid, then reduced in linear density space before tone mapping.
-// The uint64 accumulator preserves extreme knots without saturation.
-func buildDensity64(p coefficients, burnIn, iterations, width, height int) ([]uint64, bounds, error) {
-	b, err := orbitBounds(p, burnIn, iterations)
-	if err != nil {
-		return nil, bounds{}, err
-	}
+// buildDensity64InBounds uses the robust bounds already established during
+// screening, avoiding an otherwise full-length extra orbit pass per render.
+// Sixteen-bit bilinear weights and uint64 accumulation preserve subpixel detail
+// and extreme knots without saturation.
+func buildDensity64InBounds(p coefficients, b bounds, burnIn, iterations, width, height int) ([]uint64, error) {
 	density := make([]uint64, width*height)
 	x, y := 0.1, 0.1
+	scaleX := float64(width-1) / (b.MaxX - b.MinX)
+	scaleY := float64(height-1) / (b.MaxY - b.MinY)
 	for i := 0; i < burnIn+iterations; i++ {
 		x, y = clifford(p, x, y)
 		if i < burnIn {
 			continue
 		}
-		fx := (x - b.MinX) / (b.MaxX - b.MinX) * float64(width-1)
-		fy := (b.MaxY - y) / (b.MaxY - b.MinY) * float64(height-1)
-		x0, y0 := int(math.Floor(fx)), int(math.Floor(fy))
-		if x0 < 0 || x0 >= width || y0 < 0 || y0 >= height {
+		fx := (x - b.MinX) * scaleX
+		fy := (b.MaxY - y) * scaleY
+		if fx < 0 || fx >= float64(width) || fy < 0 || fy >= float64(height) {
 			continue
 		}
+		x0, y0 := int(fx), int(fy)
 		dx, dy := fx-float64(x0), fy-float64(y0)
-		addDensity(density, width, height, x0, y0, uint64(math.Round(65536*(1-dx)*(1-dy))))
-		addDensity(density, width, height, x0+1, y0, uint64(math.Round(65536*dx*(1-dy))))
-		addDensity(density, width, height, x0, y0+1, uint64(math.Round(65536*(1-dx)*dy)))
-		addDensity(density, width, height, x0+1, y0+1, uint64(math.Round(65536*dx*dy)))
+		wx1, wy1 := uint64(dx*65536+0.5), uint64(dy*65536+0.5)
+		wx0, wy0 := uint64(65536)-wx1, uint64(65536)-wy1
+		addDensity(density, width, height, x0, y0, (wx0*wy0+32768)>>16)
+		addDensity(density, width, height, x0+1, y0, (wx1*wy0+32768)>>16)
+		addDensity(density, width, height, x0, y0+1, (wx0*wy1+32768)>>16)
+		addDensity(density, width, height, x0+1, y0+1, (wx1*wy1+32768)>>16)
 	}
-	return density, b, nil
+	return density, nil
 }
 
 func addDensity(density []uint64, width, height, x, y int, weight uint64) {
@@ -883,15 +918,16 @@ func writePNG16GlowHDR(path string, density []uint64, densityWidth, densityHeigh
 		}
 	}
 	const lutSize = 65536
-	lut := make([]uint16, lutSize)
+	lut := make([]color.RGBA64, lutSize)
 	invGamma := 1 / gamma
-	for i := 1; i < lutSize; i++ {
+	for i := 0; i < lutSize; i++ {
 		// Square-root indexing gives faint densities much more LUT precision while
 		// retaining the complete, unclipped highlight range through the filmic curve.
 		t := float64(i) / float64(lutSize-1)
 		signal := t * t * maxSignal
 		mapped := acesToneMap(signal * exposure)
-		lut[i] = uint16(math.Round(65535 * math.Pow(mapped, invGamma)))
+		v := math.Pow(mapped, invGamma)
+		lut[i] = deepSpacePalette(v)
 	}
 	img := image.NewRGBA64(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
@@ -900,8 +936,12 @@ func writePNG16GlowHDR(path string, density []uint64, densityWidth, densityHeigh
 			signal := linear[i]/whitePoint + glowStrength*float64(glow[i])
 			index := int(math.Round(math.Sqrt(signal/maxSignal) * (lutSize - 1)))
 			index = max(0, min(lutSize-1, index))
-			v := float64(lut[index]) / 65535
-			img.SetRGBA64(x, y, deepSpacePalette(v))
+			c := lut[index]
+			offset := y*img.Stride + x*8
+			img.Pix[offset+0], img.Pix[offset+1] = byte(c.R>>8), byte(c.R)
+			img.Pix[offset+2], img.Pix[offset+3] = byte(c.G>>8), byte(c.G)
+			img.Pix[offset+4], img.Pix[offset+5] = byte(c.B>>8), byte(c.B)
+			img.Pix[offset+6], img.Pix[offset+7] = 0xff, 0xff
 		}
 	}
 	f, err := os.Create(path)
